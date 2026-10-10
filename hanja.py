@@ -145,6 +145,10 @@ def parse_file(f):
     else:
         rows = parse_text(decode_bytes(data))
 
+    return build_words(rows)
+
+
+def build_words(rows):
     words, seen, dropped = [], set(), 0
     for h, m, s_ in rows:
         h = h.strip()
@@ -222,15 +226,44 @@ def normalize(img, out=64, pad=4):
     return np.array(canvas) > 100
 
 
-def dilate(mask, size=7):
+def dilate(mask, size=5):
     img = Image.fromarray((mask * 255).astype("uint8"))
     return np.array(img.filter(ImageFilter.MaxFilter(size))) > 127
 
 
+def thin(mask):
+    """Zhang-Suen 세선화: 굵은 글자/가는 손글씨를 같은 굵기(1픽셀 골격)로 맞춤"""
+    a = np.pad(mask.astype(np.uint8), 1)
+    changed = True
+    while changed:
+        changed = False
+        for step in (0, 1):
+            p = a
+            P2, P3, P4, P5 = p[:-2, 1:-1], p[:-2, 2:], p[1:-1, 2:], p[2:, 2:]
+            P6, P7, P8, P9 = p[2:, 1:-1], p[2:, :-2], p[1:-1, :-2], p[:-2, :-2]
+            c = p[1:-1, 1:-1]
+            B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9
+            seq = [P2, P3, P4, P5, P6, P7, P8, P9, P2]
+            A = sum(((seq[i] == 0) & (seq[i + 1] == 1)).astype(np.uint8) for i in range(8))
+            if step == 0:
+                m = (P2 * P4 * P6 == 0) & (P4 * P6 * P8 == 0)
+            else:
+                m = (P2 * P4 * P8 == 0) & (P2 * P6 * P8 == 0)
+            d = (c == 1) & (B >= 2) & (B <= 6) & (A == 1) & m
+            if d.any():
+                a[1:-1, 1:-1][d] = 0
+                changed = True
+    return a[1:-1, 1:-1].astype(bool)
+
+
 def similarity(u, t):
-    ud, td = dilate(u), dilate(t)
-    p = (u & td).sum() / max(u.sum(), 1)
-    r = (t & ud).sum() / max(t.sum(), 1)
+    """두 글자의 골격이 서로 얼마나 겹치는지(허용 오차 2픽셀) 0~1 점수"""
+    su, st_ = thin(u), thin(t)
+    if su.sum() < 3 or st_.sum() < 3:
+        return 0.0
+    ud, td = dilate(su), dilate(st_)
+    p = (su & td).sum() / su.sum()
+    r = (st_ & ud).sum() / st_.sum()
     return 0.0 if p + r == 0 else float(2 * p * r / (p + r))
 
 
@@ -472,7 +505,7 @@ def submit_write(w, data, font):
             st.warning("글씨를 인식하지 못했어요. 조금 더 크게 써 주세요.")
             return
         score, u, t = r
-        ok = score >= s.get("set_thr", 0.6)
+        ok = score >= s.get("set_thr", 0.7)
         record(w, "write", ok, f"유사도 {score:.2f}")
         s.feedback = {"type": "write", "ok": ok, "pending": False, "score": score, "overlay": overlay(u, t)}
     else:  # 폰트가 없으면 자가 채점
@@ -550,7 +583,7 @@ def render_summary():
                 for r in res
             ]
         )
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
     wrong_items = [{"w": r["w"], "type": r["type"]} for r in res if not r["correct"]]
     b1, b2, _ = st.columns([1, 1.4, 3])
     b1.button("🔁 새로 시작", on_click=start_quiz)
@@ -572,7 +605,7 @@ def render_wrong():
             for v in s.wrong.values()
         ]
     ).sort_values("틀린 횟수", ascending=False)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
     sel = st.multiselect("오답 노트에서 뺄 한자", list(s.wrong.keys()))
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("선택 삭제") and sel:
@@ -610,7 +643,7 @@ def render_stats():
     a.metric("푼 문제", int(tr + tw))
     b.metric("전체 정답률", f"{tr / (tr + tw) * 100:.0f}%")
     c.metric("약한 한자(정답률 50% 미만)", int((df["정답률(%)"] < 50).sum()))
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
     st.bar_chart(df.set_index("한자")[["맞음", "틀림"]])
 
 
@@ -623,7 +656,7 @@ def render_study():
     df = pd.DataFrame(s.words).rename(columns={"hanja": "한자", "meaning": "뜻", "sound": "음"})
     if hide:
         df["뜻"], df["음"] = "???", "?"
-    st.dataframe(df, use_container_width=True, hide_index=True, height=500)
+    st.dataframe(df, width="stretch", hide_index=True, height=500)
 
 
 # ----------------------------------------------------------------------
@@ -635,7 +668,7 @@ SAMPLE_CSV = "한자,뜻,음\n天,하늘,천\n地,땅,지\n人,사람,인\n山,�
 def sidebar():
     s = st.session_state
     st.sidebar.title("📖 한자 퀴즈")
-    f = st.sidebar.file_uploader("한자 파일 업로드 (csv / xlsx / txt)", type=["csv", "xlsx", "xls", "txt"])
+    f = st.sidebar.file_uploader("한자 파일 업로드 (txt / csv / xlsx)")  # 형식 제한 없음: 태블릿 호환
     st.sidebar.download_button("샘플 CSV 받기", SAMPLE_CSV.encode("utf-8-sig"), "sample_hanja.csv", "text/csv")
     if f is not None:
         sig = (f.name, f.size)
@@ -649,6 +682,16 @@ def sidebar():
                 )
             except Exception as e:
                 s.flash = f"파일을 읽지 못했어요: {e}"
+    with st.sidebar.expander("✍️ 텍스트 직접 붙여넣기 (파일이 안 될 때)"):
+        pasted = st.text_area("한 줄에 '한자 뜻 음' (예: 天 하늘 천)", height=150, key="paste_text")
+        if st.button("붙여넣은 내용 적용"):
+            words, dropped = build_words(parse_text(pasted))
+            if words:
+                s.words, s.quiz = words, []
+                s.file_sig = (f.name, f.size) if f is not None else None  # 업로드 파일이 덮어쓰지 않게
+                s.flash = f"{len(words)}개 한자를 불러왔어요."
+            else:
+                s.flash = "읽을 수 있는 줄이 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요."
     st.sidebar.caption(f"불러온 한자: {len(s.words)}개")
 
     st.sidebar.divider()
@@ -656,9 +699,9 @@ def sidebar():
     st.sidebar.radio("문제 범위", ["전체 단어", "오답 노트만"], key="set_source")
     st.sidebar.number_input("문제 수", 1, 500, 10, key="set_count")
     st.sidebar.checkbox("순서 섞기", value=True, key="set_shuffle")
-    st.sidebar.slider("손글씨 채점 기준 (높을수록 엄격)", 0.3, 0.9, 0.6, 0.05, key="set_thr")
+    st.sidebar.slider("손글씨 채점 기준 (높을수록 엄격)", 0.4, 0.95, 0.7, 0.05, key="set_thr")
     st.sidebar.slider("펜 굵기", 3, 20, 8, key="set_stroke")
-    st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, use_container_width=True)
+    st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, width="stretch")
 
     if not find_font():
         st.sidebar.warning("한자 폰트를 못 찾아서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
@@ -674,13 +717,13 @@ def sidebar():
         st.write(f"한자 폰트: {find_font() or '없음'}")
 
     st.sidebar.divider()
-    st.sidebar.button("🔄 퀴즈 초기화", on_click=reset_quiz, use_container_width=True)
+    st.sidebar.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
     st.sidebar.checkbox("전체 초기화 확인 (오답 노트·통계 삭제)", key="confirm_reset")
     st.sidebar.button(
         "🗑️ 전체 초기화",
         on_click=reset_all,
         disabled=not s.get("confirm_reset", False),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.sidebar.divider()
