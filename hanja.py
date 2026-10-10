@@ -10,6 +10,8 @@ import json
 import os
 import random
 import re
+import tempfile
+import urllib.request
 from datetime import datetime
 
 import numpy as np
@@ -55,18 +57,57 @@ def load_font(path, size):
     return ImageFont.truetype(path, size)
 
 
-@st.cache_resource
-def find_font():
-    for pat in FONT_PATTERNS:
+FONT_URL = "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/KR/NotoSansKR-Regular.otf"
+_FONT = {"path": None, "source": ""}
+
+
+def _system_font():
+    pats = list(FONT_PATTERNS) + [
+        "/usr/share/fonts/**/*CJK*",
+        "/usr/share/fonts/**/*Noto*KR*",
+        "/usr/share/fonts/**/*Nanum*",
+    ]
+    for pat in pats:
         if not pat:
             continue
-        for p in glob.glob(pat):
+        for p in sorted(glob.glob(pat, recursive=True)):
+            if not p.lower().endswith((".ttf", ".otf", ".ttc")):
+                continue
             try:
                 load_font(p, 40)
                 return p
             except Exception:
                 continue
     return None
+
+
+def _download_font():
+    """시스템에 한자 폰트가 없을 때 Noto Sans KR(약 4.6MB)을 한 번 내려받아 사용"""
+    path = os.path.join(tempfile.gettempdir(), "hanja_font", "NotoSansKR-Regular.otf")
+    try:
+        if not (os.path.exists(path) and os.path.getsize(path) > 1_000_000):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with urllib.request.urlopen(FONT_URL, timeout=60) as r, open(path + ".part", "wb") as f:
+                f.write(r.read())
+            os.replace(path + ".part", path)
+        load_font(path, 40)
+        return path
+    except Exception:
+        return None
+
+
+def find_font():
+    """성공한 결과만 저장해서, 실패하면 다음 실행 때 다시 시도"""
+    if _FONT["path"]:
+        return _FONT["path"]
+    p = _system_font()
+    if p:
+        _FONT.update(path=p, source="서버에 설치된 폰트")
+        return p
+    p = _download_font()
+    if p:
+        _FONT.update(path=p, source="자동 내려받음")
+    return p
 
 
 # ----------------------------------------------------------------------
@@ -704,7 +745,7 @@ def sidebar():
     st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, width="stretch")
 
     if not find_font():
-        st.sidebar.warning("한자 폰트를 못 찾아서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
+        st.sidebar.warning("한자 폰트를 찾지 못하고 자동으로 내려받지도 못해서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
     if not HAS_CANVAS:
         st.sidebar.error(
             "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못했어요. "
@@ -714,7 +755,7 @@ def sidebar():
     with st.sidebar.expander("진단 정보"):
         st.write(f"Streamlit 버전: {st.__version__}")
         st.write(f"캔버스 라이브러리: {'정상' if HAS_CANVAS else '불러오기 실패'}")
-        st.write(f"한자 폰트: {find_font() or '없음'}")
+        st.write(f"한자 폰트: {find_font() or '없음'} ({_FONT['source'] or '-'})")
 
     st.sidebar.divider()
     st.sidebar.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
