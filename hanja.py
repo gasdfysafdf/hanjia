@@ -17,7 +17,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 CANVAS_ERR = ""
 try:
@@ -234,10 +234,74 @@ def check_reading(user, w):
 
 
 # ----------------------------------------------------------------------
-# 손글씨 비교 (이미지 유사도)
+# 손글씨 채점 (골격 비교 + 위치·크기 보정 + 획 단위 검사 + 비슷한 글자 구분)
 # ----------------------------------------------------------------------
-def render_char(ch, font_path, size=256):
-    font = load_font(font_path, int(size * 0.8))
+GRID = 96  # 비교용 격자 크기
+GPAD = 8  # 격자 가장자리 여백
+INNER = GRID - 2 * GPAD  # 글자가 차지하는 영역 (80)
+
+# 채점 설정의 기본값. 키 이름은 사이드바 위젯의 key 와 같음
+GRADE_DEFAULTS = dict(
+    set_thr=0.70,  # 통과 점수
+    set_tol=4.0,  # 위치 허용 오차 (글자 크기의 %)
+    set_align=1.5,  # 위치·크기·기울기 보정 강도 (0 = 끔)
+    set_beta=1.0,  # 1보다 크면 '빠진 획'에, 작으면 '덧쓴 획'에 더 엄격
+    set_chk=True,  # 획 단위 검사 (빠진 획 / 덧쓴 획)
+    set_miss=12.0,  # 이 길이(글자 크기의 %) 이상 어긋난 획이 있으면 오답
+    set_disc=True,  # 비슷한 다른 글자와 비교
+    set_margin=0.03,  # 다른 글자가 이 점수 차 넘게 더 비슷하면 오답
+    set_variants=True,  # 같은 한자의 다른 글꼴 모양(한국/중국/일본식)도 인정
+)
+GRADE_PRESETS = {
+    "관대": dict(set_thr=0.64, set_tol=5.0, set_align=2.0, set_beta=1.0, set_chk=True,
+                 set_miss=15.0, set_disc=True, set_margin=0.05, set_variants=True),
+    "보통": dict(GRADE_DEFAULTS),
+    "엄격": dict(set_thr=0.80, set_tol=3.0, set_align=1.0, set_beta=1.2, set_chk=True,
+                 set_miss=8.0, set_disc=True, set_margin=0.01, set_variants=False),
+}
+N_CANDIDATES = 6  # 비슷한 글자 비교 때 정밀하게 따져 볼 후보 수
+STROKE_BAD = 2.0  # 허용 오차의 몇 배 넘게 떨어진 부분을 '어긋남'으로 볼지
+
+
+def grade_params():
+    s = st.session_state
+    return {k: s.get(k, v) for k, v in GRADE_DEFAULTS.items()}
+
+
+@st.cache_resource(show_spinner=False)
+def _store():
+    """폰트·정답 글자 분석 결과를 앱이 다시 실행돼도 유지하는 캐시"""
+    return {}
+
+
+def _font(path, size, index=None):
+    key = ("font", path, size, index)
+    store = _store()
+    f = store.get(key)
+    if f is None:
+        f = load_font(path, size) if index is None else ImageFont.truetype(path, size, index=index)
+        store[key] = f
+    return f
+
+
+def font_variants(path, use_variants=True):
+    """같은 한자라도 폰트 지역판(한국/중국/일본)마다 모양이 조금 달라서, 가능하면 여러 모양을 모두 정답으로 인정"""
+    if not path:
+        return []
+    if not use_variants or not path.lower().endswith(".ttc"):
+        return [(path, None)]
+    out = []
+    for idx in (1, 3, 0):  # Noto CJK: 1=KR, 3=TC, 0=JP
+        try:
+            _font(path, 40, idx)
+            out.append((path, idx))
+        except Exception:
+            continue
+    return out or [(path, None)]
+
+
+def render_char(ch, font_path, size=256, index=None):
+    font = _font(font_path, int(size * 0.8), index)
     img = Image.new("L", (size, size), 0)
     ImageDraw.Draw(img).text((size / 2, size / 2), ch, font=font, fill=255, anchor="mm")
     return img
@@ -248,28 +312,6 @@ def guide_image(ch, font_path, size=320):
     base = np.full((size, size), 255, np.uint8)
     base[mask] = 215  # 연한 회색 (채점 때 획으로 인식되지 않는 밝기)
     return Image.fromarray(base).convert("RGB")
-
-
-def normalize(img, out=64, pad=4):
-    arr = np.array(img) > 127
-    ys, xs = np.where(arr)
-    if len(ys) == 0:
-        return None
-    crop = img.crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
-    w, h = crop.size
-    side = max(w, h)
-    sq = Image.new("L", (side, side), 0)
-    sq.paste(crop, ((side - w) // 2, (side - h) // 2))
-    inner = out - 2 * pad
-    sq = sq.resize((inner, inner), Image.BILINEAR)
-    canvas = Image.new("L", (out, out), 0)
-    canvas.paste(sq, (pad, pad))
-    return np.array(canvas) > 100
-
-
-def dilate(mask, size=5):
-    img = Image.fromarray((mask * 255).astype("uint8"))
-    return np.array(img.filter(ImageFilter.MaxFilter(size))) > 127
 
 
 def thin(mask):
@@ -297,15 +339,197 @@ def thin(mask):
     return a[1:-1, 1:-1].astype(bool)
 
 
-def similarity(u, t):
-    """두 글자의 골격이 서로 얼마나 겹치는지(허용 오차 2픽셀) 0~1 점수"""
-    su, st_ = thin(u), thin(t)
-    if su.sum() < 3 or st_.sum() < 3:
+def _thick_mask(sub):
+    """글자 영역(bool)을 비율을 유지한 채 GRID 크기 정사각형에 맞춰 넣음 (겹쳐 보기·후보 고르기용)"""
+    h, w = sub.shape
+    side = max(w, h)
+    sq = Image.new("L", (side, side), 0)
+    sq.paste(Image.fromarray((sub * 255).astype("uint8")), ((side - w) // 2, (side - h) // 2))
+    sq = sq.resize((INNER, INNER), Image.BILINEAR)
+    canvas = Image.new("L", (GRID, GRID), 0)
+    canvas.paste(sq, (GPAD, GPAD))
+    return np.array(canvas) > 100
+
+
+def _dist_map(pts):
+    """격자의 모든 칸에서 가장 가까운 골격 점까지의 거리"""
+    g = np.arange(GRID, dtype=np.float32)
+    gx, gy = np.meshgrid(g, g)
+    gx, gy = gx.reshape(-1, 1), gy.reshape(-1, 1)
+    out = np.empty(GRID * GRID, np.float32)
+    for i in range(0, GRID * GRID, 1024):
+        d2 = (gx[i : i + 1024] - pts[:, 0][None, :]) ** 2 + (gy[i : i + 1024] - pts[:, 1][None, :]) ** 2
+        out[i : i + 1024] = np.sqrt(d2.min(1))
+    return out.reshape(GRID, GRID)
+
+
+def prep_shape(mask):
+    """글씨(bool 이미지) -> 크기를 맞춘 골격 점들 + 거리 맵. 글자가 없으면 None"""
+    ys, xs = np.nonzero(mask)
+    if len(ys) < 20:
+        return None
+    x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    w, h = int(x1 - x0), int(y1 - y0)
+    sub = mask[y0:y1, x0:x1]
+    sy, sx = np.nonzero(thin(sub))
+    if len(sy) < 3:
+        return None
+    scale = INNER / max(w, h)
+    pts = np.stack([(sx + 0.5 - w / 2) * scale + GRID / 2, (sy + 0.5 - h / 2) * scale + GRID / 2], 1)
+    pts = pts.astype(np.float32)
+    if len(pts) > 900:
+        pts = pts[:: -(-len(pts) // 900)]
+    return {"pts": pts, "thick": _thick_mask(sub), "dt": _dist_map(pts)}
+
+
+def get_templates(ch, font_path, use_variants=True):
+    """정답 글자의 골격(글꼴 변형별). 한 번 계산하면 캐시에 보관"""
+    key = ("tpl", font_path, ch, bool(use_variants))
+    store = _store()
+    if key in store:
+        return store[key]
+    out, seen = [], set()
+    for path, idx in font_variants(font_path, use_variants):
+        try:
+            arr = np.array(render_char(ch, path, 192, idx)) > 127
+        except Exception:
+            continue
+        sig = hash(arr.tobytes())
+        if sig in seen:
+            continue
+        seen.add(sig)
+        shp = prep_shape(arr)
+        if shp is not None:
+            out.append(shp)
+    store[key] = out
+    return out
+
+
+def _lowres(thick):
+    im = Image.fromarray((thick * 255).astype("uint8")).resize((24, 24), Image.BOX)
+    v = np.asarray(im, np.float32).ravel()
+    v = v - v.mean()
+    return v / (np.linalg.norm(v) + 1e-6)
+
+
+def _vocab_feat(ch, font_path):
+    key = ("vf", font_path, ch)
+    store = _store()
+    if key not in store:
+        v = None
+        try:
+            arr = np.array(render_char(ch, font_path, 128)) > 127
+            ys, xs = np.nonzero(arr)
+            if len(ys) >= 20:
+                v = _lowres(_thick_mask(arr[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]))
+        except Exception:
+            pass
+        store[key] = v
+    return store[key]
+
+
+# --- 위치·크기·기울기 보정 -------------------------------------------------
+# 변환 T = (dx, dy, log sx, log sy, 각도(rad)) : 내 글씨 점을 이동·확대·회전해서 정답에 맞춰 봄
+def _steps(level):
+    a, k, r = 1.6 * level, 0.06 * level, np.deg2rad(2.0 * level)
+    return a, a, k, k, r
+
+
+def _grid_around(center, steps, frac=1.0):
+    ax = [np.array([-1.0, 0.0, 1.0]) * s * frac + c for c, s in zip(center, steps)]
+    mesh = np.meshgrid(*ax, indexing="ij")
+    return np.stack([m.ravel() for m in mesh], 1).astype(np.float32)
+
+
+def _apply(pts, T):
+    c = GRID / 2
+    x = (pts[:, 0] - c)[None, :] * np.exp(T[:, 2])[:, None]
+    y = (pts[:, 1] - c)[None, :] * np.exp(T[:, 3])[:, None]
+    co, si = np.cos(T[:, 4])[:, None], np.sin(T[:, 4])[:, None]
+    return co * x - si * y + T[:, 0:1] + c, si * x + co * y + T[:, 1:2] + c
+
+
+def _apply_inv(pts, T):
+    c = GRID / 2
+    x = (pts[:, 0] - c)[None, :] - T[:, 0:1]
+    y = (pts[:, 1] - c)[None, :] - T[:, 1:2]
+    co, si = np.cos(T[:, 4])[:, None], np.sin(T[:, 4])[:, None]
+    return (co * x + si * y) / np.exp(T[:, 2])[:, None] + c, (-si * x + co * y) / np.exp(T[:, 3])[:, None] + c
+
+
+def _lookup(dm, x, y):
+    ix = np.clip(np.rint(x), 0, GRID - 1).astype(np.int32)
+    iy = np.clip(np.rint(y), 0, GRID - 1).astype(np.int32)
+    return dm[iy, ix]
+
+
+def _eval(u, t, T, tol, beta):
+    """모든 변환 후보에 대해 점수 계산. 내 글씨 점 -> 정답까지(정밀도), 정답 점 -> 내 글씨까지(재현율)"""
+    ux, uy = _apply(u["pts"], T)
+    du = _lookup(t["dt"], ux, uy)
+    tx, ty = _apply_inv(t["pts"], T)
+    dt = _lookup(u["dt"], tx, ty)
+    p = np.clip(2.0 - du / tol, 0, 1).mean(1)  # tol 이내 1점, 2*tol 에서 0점까지 부드럽게 감소
+    r = np.clip(2.0 - dt / tol, 0, 1).mean(1)
+    b2 = beta * beta
+    f = (1 + b2) * p * r / (b2 * p + r + 1e-9)
+    shift = np.hypot(T[:, 0], T[:, 1]) / INNER
+    pen = 0.30 * shift + 0.10 * (np.abs(T[:, 2]) + np.abs(T[:, 3])) + 0.10 * np.abs(T[:, 4])
+    return f - pen, p, r, du, dt
+
+
+def _pick(u, t, T, tol, beta):
+    sc, p, r, du, dt = _eval(u, t, T, tol, beta)
+    i = int(np.argmax(sc))
+    return dict(score=float(sc[i]), p=float(p[i]), r=float(r[i]), T=T[i], du=du[i], dt=dt[i])
+
+
+def _search(u, t, tol, beta, level, refine=False):
+    """거친 탐색(+선택적으로 세밀 탐색)으로 가장 잘 맞는 위치·크기·기울기를 찾음"""
+    if level <= 0:
+        return _pick(u, t, np.zeros((1, 5), np.float32), tol, beta)
+    st_ = _steps(level)
+    best = _pick(u, t, _grid_around((0, 0, 0, 0, 0), st_), tol, beta)
+    if refine:
+        for frac in (0.5, 0.25):
+            cand = _pick(u, t, _grid_around(best["T"], st_, frac), tol, beta)
+            if cand["score"] > best["score"]:
+                best = cand
+    return best
+
+
+def _max_cluster_extent(pts, bad, link=2.4):
+    """어긋난 점들 중 서로 이어진 가장 큰 덩어리의 크기(대각선 길이)"""
+    q = pts[bad]
+    n = len(q)
+    if n < 2:
         return 0.0
-    ud, td = dilate(su), dilate(st_)
-    p = (su & td).sum() / su.sum()
-    r = (st_ & ud).sum() / st_.sum()
-    return 0.0 if p + r == 0 else float(2 * p * r / (p + r))
+    adj = ((q[:, None, :] - q[None, :, :]) ** 2).sum(-1) <= link * link
+    seen = np.zeros(n, bool)
+    best = 0.0
+    for i in range(n):
+        if seen[i]:
+            continue
+        seen[i] = True
+        stack, comp = [i], [i]
+        while stack:
+            j = stack.pop()
+            for k in np.nonzero(adj[j] & ~seen)[0]:
+                seen[k] = True
+                stack.append(k)
+                comp.append(k)
+        c = q[comp]
+        best = max(best, float(np.hypot(*(c.max(0) - c.min(0)))))
+    return best
+
+
+def _aligned_user_mask(thick, T):
+    """겹쳐 보기용: 찾아낸 보정값을 내 글씨에 적용"""
+    ix, iy = _apply_inv(np.array([[0, 0], [1, 0], [0, 1]], np.float32), T[None, :])
+    (x0, y0), (x1, y1), (x2, y2) = [(float(ix[0, i]), float(iy[0, i])) for i in range(3)]
+    coef = (x1 - x0, x2 - x0, x0, y1 - y0, y2 - y0, y0)
+    img = Image.fromarray((thick * 255).astype("uint8")).transform((GRID, GRID), Image.AFFINE, coef, Image.BILINEAR)
+    return np.array(img) > 100
 
 
 def overlay(u, t, scale=4):
@@ -317,14 +541,77 @@ def overlay(u, t, scale=4):
     return Image.fromarray(rgb).resize((w * scale, h * scale), Image.NEAREST)
 
 
-def compare_writing(image_data, ch, font_path):
+def grade_writing(image_data, ch, font_path, P, candidates=()):
+    """손글씨 채점. 결과 dict (글씨를 못 알아보면 None)
+
+    1) 내 글씨와 정답 글자의 골격을 위치·크기·기울기를 보정하며 비교  -> 점수
+    2) 빠진 획 / 덧쓴 획(이어진 큰 어긋남)이 있는지 검사
+    3) 같은 단어장의 비슷한 글자와 비교해 그쪽이 더 비슷하면 오답
+    """
     gray = image_data[:, :, :3].astype(float).mean(axis=2)
-    user_img = Image.fromarray(((gray < 110) * 255).astype("uint8"))
-    u = normalize(user_img)
-    t = normalize(render_char(ch, font_path))
-    if u is None or t is None:
+    u = prep_shape(gray < 110)
+    if u is None:
         return None
-    return similarity(u, t), u, t
+    tpls = get_templates(ch, font_path, P["set_variants"])
+    if not tpls:
+        return None
+    tol = max(0.5, P["set_tol"] * INNER / 100.0)
+    beta, level = float(P["set_beta"]), float(P["set_align"])
+
+    # 정답 글자: 글꼴 변형 중 가장 비슷한 것을 골라 세밀하게 보정
+    coarse = [_search(u, t, tol, beta, level) for t in tpls]
+    ib = int(np.argmax([c["score"] for c in coarse]))
+    tpl, s_coarse = tpls[ib], coarse[ib]["score"]
+    best = _search(u, tpl, tol, beta, level, refine=True)
+    score = best["score"]
+
+    # 비슷한 다른 글자 (모양이 가장 닮은 몇 개만 정밀 비교)
+    other = None
+    if P["set_disc"] and candidates:
+        uv = _lowres(u["thick"])
+        sims = []
+        for c in dict.fromkeys(candidates):
+            if c == ch:
+                continue
+            v = _vocab_feat(c, font_path)
+            if v is not None:
+                sims.append((float(uv @ v), c))
+        sims.sort(reverse=True)
+        for _, c in sims[:N_CANDIDATES]:
+            ts = get_templates(c, font_path, P["set_variants"])
+            if not ts:
+                continue
+            sc = max(_search(u, t, tol, beta, level)["score"] for t in ts)
+            if other is None or sc > other[1]:
+                other = (c, sc)
+
+    # 획 단위 검사
+    miss = extra = 0.0
+    if P["set_chk"]:
+        bad = STROKE_BAD * tol
+        miss = _max_cluster_extent(tpl["pts"], best["dt"] > bad) / INNER * 100
+        ux, uy = _apply(u["pts"], best["T"][None, :])
+        extra = _max_cluster_extent(np.stack([ux[0], uy[0]], 1), best["du"] > bad) / INNER * 100
+
+    ok, reason, detail = score >= P["set_thr"], "", ""
+    if not ok:
+        reason = "score"
+    elif P["set_chk"] and miss >= P["set_miss"]:
+        ok, reason, detail = False, "stroke", "정답에 있는 획이 빠졌거나 많이 달라요."
+    elif P["set_chk"] and extra >= P["set_miss"]:
+        ok, reason, detail = False, "stroke", "정답에 없는 획이 더 들어갔어요."
+    elif other is not None and other[1] - s_coarse > P["set_margin"]:
+        ok, reason = False, "disc"
+        detail = f"'{other[0]}' 글자와 더 비슷하게 써졌어요. (정답 {s_coarse:.2f} < {other[0]} {other[1]:.2f})"
+    if not ok and not detail and other is not None and other[1] - s_coarse > P["set_margin"]:
+        detail = f"'{other[0]}' 글자와 더 비슷해요."
+
+    ua = _aligned_user_mask(u["thick"], best["T"])
+    return dict(
+        ok=ok, score=score, cmp=s_coarse, p=best["p"], r=best["r"], reason=reason, detail=detail,
+        miss=miss, extra=extra, other=other, overlay=overlay(ua, tpl["thick"]),
+        shift=(float(best["T"][0]), float(best["T"][1])),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -334,10 +621,11 @@ def init_state():
     defaults = dict(
         words=[], file_sig=None, quiz=[], pos=0, results=[], feedback=None,
         wrong={}, stats={}, nonce=0, retry_mode=False, hint=False, flash="",
-        progress_sig=None,
+        progress_sig=None, calib=[], set_preset="보통",
     )
+    defaults.update(GRADE_DEFAULTS)
     for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
+        st.session_state.setdefault(k, list(v) if isinstance(v, list) else v)
 
 
 def reset_round(quiz, retry=False):
@@ -413,6 +701,8 @@ def override_correct():
     if last["correct"]:
         return
     key = last["w"]["hanja"]
+    if last["type"] == "write" and (s.feedback or {}).get("score") is not None:
+        s.calib.append({"score": s.feedback["score"], "why": s.feedback.get("reason", "")})
     last["correct"] = True
     s.stats[key]["wrong"] -= 1
     s.stats[key]["right"] += 1
@@ -541,14 +831,18 @@ def render_write(w):
 def submit_write(w, data, font):
     s = st.session_state
     if font:
-        r = compare_writing(data, w["hanja"], font)
+        cands = [x["hanja"] for x in s.words if len(x["hanja"]) == 1]
+        with st.spinner("채점 중..."):
+            r = grade_writing(data, w["hanja"], font, grade_params(), cands)
         if r is None:
             st.warning("글씨를 인식하지 못했어요. 조금 더 크게 써 주세요.")
             return
-        score, u, t = r
-        ok = score >= s.get("set_thr", 0.7)
-        record(w, "write", ok, f"유사도 {score:.2f}")
-        s.feedback = {"type": "write", "ok": ok, "pending": False, "score": score, "overlay": overlay(u, t)}
+        record(w, "write", r["ok"], f"유사도 {r['score']:.2f}")
+        s.feedback = {
+            "type": "write", "ok": r["ok"], "pending": False, "score": r["score"], "overlay": r["overlay"],
+            "detail": r["detail"], "reason": r["reason"], "p": r["p"], "r": r["r"],
+            "gap": max(r["miss"], r["extra"]), "other": r["other"],
+        }
     else:  # 폰트가 없으면 자가 채점
         s.feedback = {"type": "write", "ok": False, "pending": True, "score": None, "overlay": None}
     st.rerun()
@@ -591,6 +885,12 @@ def render_feedback(q):
             st.success("정답! 🎉" + (f"  (유사도 {fb['score']:.2f})" if fb["score"] is not None else ""))
         else:
             st.error("오답이에요." + (f"  (유사도 {fb['score']:.2f})" if fb["score"] is not None else ""))
+        if fb.get("p") is not None:
+            line = (f"내 글씨가 정답과 맞는 정도 {fb['p']:.0%} · 정답 획을 채운 정도 {fb['r']:.0%}"
+                    f" · 가장 크게 어긋난 획 {fb['gap']:.0f}%")
+            if fb.get("other"):
+                line += f" · 가장 비슷한 다른 글자 '{fb['other'][0]}' {fb['other'][1]:.2f}"
+            st.caption(line)
         if fb.get("overlay") is not None:
             st.image(fb["overlay"], caption="빨강: 정답 글자 / 파랑: 내 글씨 / 보라: 겹친 부분", width=256)
         if fb.get("detail"):
@@ -703,6 +1003,64 @@ def render_study():
 # ----------------------------------------------------------------------
 # 사이드바 + 메인
 # ----------------------------------------------------------------------
+def apply_preset():
+    name = st.session_state.get("set_preset")
+    if name in GRADE_PRESETS:
+        st.session_state.update(GRADE_PRESETS[name])
+
+
+def mark_custom():
+    st.session_state.set_preset = "직접 설정"
+
+
+def grading_sidebar():
+    s = st.session_state
+    with st.sidebar.expander("🎯 손글씨 채점 세부 설정"):
+        st.selectbox("프리셋", ["관대", "보통", "엄격", "직접 설정"], key="set_preset", on_change=apply_preset,
+                     help="한 번에 여러 설정을 바꿔요. 아래 값을 직접 건드리면 '직접 설정'이 돼요.")
+        st.markdown("**기본 채점**")
+        st.slider("통과 점수 (높을수록 엄격)", 0.30, 0.95, step=0.01, key="set_thr", on_change=mark_custom,
+                  help="내 글씨와 정답 글자가 얼마나 겹치는지 0~1점으로 계산해서, 이 점수 이상이면 정답이에요.")
+        st.slider("위치 허용 오차 (글자 크기의 %)", 1.0, 10.0, step=0.5, key="set_tol", on_change=mark_custom,
+                  help="획이 정답 위치에서 이만큼 벗어나도 완전히 맞는 걸로 쳐요. 작을수록 엄격해요.")
+        st.slider("위치·크기·기울기 보정", 0.0, 3.0, step=0.5, key="set_align", on_change=mark_custom,
+                  help="글씨가 한쪽으로 치우치거나, 납작/길쭉하거나, 기울어도 정답에 가장 잘 맞게 자동으로 맞춰서 비교해요. 0이면 끔.")
+        st.slider("빠진 획 ↔ 덧쓴 획", 0.5, 2.0, step=0.1, key="set_beta", on_change=mark_custom,
+                  help="1.0은 균형. 1보다 크면 획이 빠진 것을 더 엄하게, 1보다 작으면 쓸데없는 획이 있는 것을 더 엄하게 봐요.")
+        st.markdown("**획 단위 검사**")
+        st.checkbox("빠진 획 / 덧쓴 획 검사", key="set_chk", on_change=mark_custom,
+                    help="전체 점수가 높아도, 획 하나가 통째로 빠지거나 더 들어갔으면 오답으로 처리해요.")
+        st.slider("허용 길이 (글자 크기의 %)", 4.0, 30.0, step=1.0, key="set_miss", on_change=mark_custom,
+                  disabled=not s.get("set_chk", True),
+                  help="이 길이 이상으로 이어서 어긋난 부분이 있으면 오답이에요. 작을수록 엄격하고, 점·짧은 획까지 따져요.")
+        st.markdown("**비슷한 글자 구분**")
+        st.checkbox("비슷한 다른 글자와 비교", key="set_disc", on_change=mark_custom,
+                    help="단어장 안의 모양이 닮은 글자(예: 大·太·犬)와 비교해서, 그쪽이 더 비슷하면 오답으로 처리해요.")
+        st.slider("점수 차 허용", 0.00, 0.20, step=0.01, key="set_margin", on_change=mark_custom,
+                  disabled=not s.get("set_disc", True),
+                  help="다른 글자가 정답보다 이 점수 넘게 더 비슷할 때만 오답이에요. 클수록 관대해요.")
+        st.checkbox("글꼴 모양 차이 허용 (한국·중국·일본식)", key="set_variants", on_change=mark_custom,
+                    help="같은 한자도 나라별 글꼴에서 모양이 조금 달라서, 가능하면 여러 모양을 모두 정답으로 인정해요.")
+        if st.button("기본값으로 되돌리기"):
+            s.update(GRADE_DEFAULTS)
+            s.set_preset = "보통"
+            st.rerun()
+        if s.calib:
+            st.markdown("**💡 채점 기준 추천**")
+            scores = [c["score"] for c in s.calib if c["why"] == "score"]
+            others = [c for c in s.calib if c["why"] != "score"]
+            st.caption(f"'내가 맞게 썼어요'로 정정한 손글씨 {len(s.calib)}건을 참고했어요.")
+            if scores:
+                sug = max(0.30, round(min(scores) - 0.01, 2))
+                if sug < s.get("set_thr", 0.7):
+                    st.button(f"통과 점수를 {sug:.2f}로 낮추기", on_click=lambda v=sug: s.update(set_thr=v, set_preset="직접 설정"))
+            if any(c["why"] == "stroke" for c in others):
+                st.caption("획 검사 때문에 오답 처리된 정정이 있어요 → '허용 길이'를 늘려 보세요.")
+            if any(c["why"] == "disc" for c in others):
+                st.caption("비슷한 글자 비교 때문에 오답 처리된 정정이 있어요 → '점수 차 허용'을 늘려 보세요.")
+            st.button("추천 기록 지우기", on_click=lambda: s.calib.clear())
+
+
 SAMPLE_CSV = "한자,뜻,음\n天,하늘,천\n地,땅,지\n人,사람,인\n山,메,산\n水,물,수\n火,불,화\n日,날,일\n月,달,월\n"
 
 
@@ -740,7 +1098,7 @@ def sidebar():
     st.sidebar.radio("문제 범위", ["전체 단어", "오답 노트만"], key="set_source")
     st.sidebar.number_input("문제 수", 1, 500, 10, key="set_count")
     st.sidebar.checkbox("순서 섞기", value=True, key="set_shuffle")
-    st.sidebar.slider("손글씨 채점 기준 (높을수록 엄격)", 0.4, 0.95, 0.7, 0.05, key="set_thr")
+    grading_sidebar()
     st.sidebar.slider("펜 굵기", 3, 20, 8, key="set_stroke")
     st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, width="stretch")
 
