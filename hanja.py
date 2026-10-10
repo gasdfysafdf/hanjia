@@ -17,12 +17,14 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+CANVAS_ERR = ""
 try:
     from streamlit_drawable_canvas import st_canvas
 
     HAS_CANVAS = True
-except Exception:  # 라이브러리가 없어도 뜻·음 문제는 풀 수 있게
+except Exception as _e:  # 라이브러리가 없어도 뜻·음 문제는 풀 수 있게
     HAS_CANVAS = False
+    CANVAS_ERR = f"{type(_e).__name__}: {_e}"
 
 st.set_page_config(page_title="한자 퀴즈", page_icon="📖", layout="wide")
 
@@ -280,6 +282,15 @@ def start_quiz():
         s.flash = "문제로 만들 단어가 없어요. 파일을 올리거나 오답 노트를 확인해 주세요."
         return
     kind = s.get("set_type", "섞어서")
+    note = ""
+    if kind in ("한자 쓰기", "섞어서") and not HAS_CANVAS:
+        if kind == "한자 쓰기":
+            s.flash = (
+                "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못해서 시작할 수 없어요. "
+                "왼쪽 아래 '진단 정보'를 확인해 주세요."
+            )
+            return
+        note = "⚠️ 한자 쓰기 기능을 불러오지 못해 뜻·음 문제만 나와요. (왼쪽 '진단 정보' 확인)"
     items = []
     for w in pool:
         can_write = HAS_CANVAS and len(w["hanja"]) == 1
@@ -298,6 +309,7 @@ def start_quiz():
         s.flash = "선택한 유형으로 만들 수 있는 문제가 없어요. (한자 쓰기는 한 글자 한자만 가능)"
         return
     reset_round(items, retry=(source == "오답 노트만"))
+    s.flash = note
 
 
 def record(w, qtype, ok, ans):
@@ -345,6 +357,24 @@ def next_question():
     s.nonce += 1
 
 
+def reset_quiz():
+    """진행 중인 퀴즈만 초기화 (오답 노트·통계는 유지)"""
+    s = st.session_state
+    s.quiz, s.pos, s.results = [], 0, []
+    s.feedback, s.hint = None, False
+    s.nonce += 1
+    s.flash = "퀴즈를 초기화했어요. '시작'을 눌러 새로 시작하세요."
+
+
+def reset_all():
+    """퀴즈 + 오답 노트 + 통계 전부 초기화 (불러온 단어는 유지)"""
+    s = st.session_state
+    s.wrong, s.stats = {}, {}
+    reset_quiz()
+    s.confirm_reset = False
+    s.flash = "퀴즈, 오답 노트, 통계를 모두 초기화했어요."
+
+
 # ----------------------------------------------------------------------
 # 화면: 문제 풀기
 # ----------------------------------------------------------------------
@@ -382,6 +412,33 @@ def finish_read(w, ans):
     st.rerun()
 
 
+def draw_canvas(bg, key):
+    s = st.session_state
+    kwargs = dict(
+        fill_color="rgba(255,255,255,0)",
+        stroke_width=int(s.get("set_stroke", 8)),
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        height=320,
+        width=320,
+        drawing_mode="freedraw",
+        key=key,
+    )
+    err = None
+    try:
+        return st_canvas(background_image=bg, **kwargs)
+    except Exception as e:
+        err = e
+    if bg is not None:  # 가이드(배경 이미지)가 문제일 수 있어 끄고 재시도
+        st.warning("이 환경에서는 연한 글씨 가이드가 동작하지 않아 끄고 진행해요.")
+        try:
+            return st_canvas(background_image=None, **kwargs)
+        except Exception as e2:
+            err = e2
+    st.error(f"캔버스를 표시하지 못했어요: {type(err).__name__}: {err}")
+    return None
+
+
 def render_write(w):
     s = st.session_state
     font = find_font()
@@ -390,17 +447,7 @@ def render_write(w):
     bg = guide_image(w["hanja"], font) if (hint and font) else None
     left, _ = st.columns([1, 1])
     with left:
-        res = st_canvas(
-            fill_color="rgba(255,255,255,0)",
-            stroke_width=int(s.get("set_stroke", 8)),
-            stroke_color="#000000",
-            background_color="#FFFFFF",
-            background_image=bg,
-            height=320,
-            width=320,
-            drawing_mode="freedraw",
-            key=f"cv_{s.pos}_{s.nonce}_{int(hint)}",
-        )
+        res = draw_canvas(bg, f"cv_{s.pos}_{s.nonce}_{int(hint)}")
     b1, b2, b3, _ = st.columns([1, 1, 1, 3])
     if b1.button("제출", type="primary"):
         data = res.image_data if res is not None else None
@@ -614,9 +661,27 @@ def sidebar():
     st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, use_container_width=True)
 
     if not find_font():
-        st.sidebar.warning("한자 폰트를 못 찾아서 손글씨는 자가 채점으로 진행돼요. (README 참고)")
+        st.sidebar.warning("한자 폰트를 못 찾아서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
     if not HAS_CANVAS:
-        st.sidebar.warning("streamlit-drawable-canvas가 없어 '한자 쓰기' 문제는 꺼져 있어요.")
+        st.sidebar.error(
+            "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못했어요. "
+            "저장소의 requirements.txt(소문자)에 streamlit-drawable-canvas==0.9.3 이 있는지 확인하고 앱을 Reboot 해 주세요."
+        )
+        st.sidebar.code(CANVAS_ERR)
+    with st.sidebar.expander("진단 정보"):
+        st.write(f"Streamlit 버전: {st.__version__}")
+        st.write(f"캔버스 라이브러리: {'정상' if HAS_CANVAS else '불러오기 실패'}")
+        st.write(f"한자 폰트: {find_font() or '없음'}")
+
+    st.sidebar.divider()
+    st.sidebar.button("🔄 퀴즈 초기화", on_click=reset_quiz, use_container_width=True)
+    st.sidebar.checkbox("전체 초기화 확인 (오답 노트·통계 삭제)", key="confirm_reset")
+    st.sidebar.button(
+        "🗑️ 전체 초기화",
+        on_click=reset_all,
+        disabled=not s.get("confirm_reset", False),
+        use_container_width=True,
+    )
 
     st.sidebar.divider()
     st.sidebar.caption("진행 상황 저장 / 불러오기 (오답 노트 + 통계)")
@@ -641,6 +706,8 @@ def main():
     s = st.session_state
     if s.flash:
         st.info(s.flash)
+    if not HAS_CANVAS:
+        st.warning("한자 쓰기 기능을 불러오지 못해 지금은 뜻·음 문제만 풀 수 있어요. 왼쪽 '진단 정보'를 확인해 주세요.")
     t1, t2, t3, t4 = st.tabs(["✏️ 문제 풀기", "📕 오답 노트", "📊 통계", "📚 단어장"])
     with t1:
         if not s.quiz:
