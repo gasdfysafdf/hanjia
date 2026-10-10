@@ -1,0 +1,7 @@
+streamlit==1.38.0
+streamlit-drawable-canvas==0.9.3
+numpy<2
+pandas
+Pillow
+openpyxl
+ 
