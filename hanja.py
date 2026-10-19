@@ -1,10 +1,14 @@
-"""한자 퀴즈 웹앱 (Streamlit)
+"""한자 연습장 웹앱 (Streamlit)
 
-- 한자 파일(csv / xlsx / txt) 업로드 -> 문제 자동 생성
-- 문제 유형: 뜻·음 쓰기(채팅 입력), 한자 쓰기(캔버스 손글씨)
-- 오답 노트, 오답만 다시 풀기, 통계, 암기 모드, 진행 상황 저장/불러오기
+- 한자 파일(csv / xlsx / txt) 업로드 -> 문제 자동 생성 ('급수/단원/분류' 열이 있으면 범위 선택 가능)
+- 문제 유형: 뜻·음 쓰기(채팅 입력), 한자 쓰기(캔버스 손글씨), 객관식 2종
+- 플래시카드, 복습 주기(간격 반복), 오늘의 목표, 날짜별 기록
+- 오답 노트, 오답만 다시 풀기, 통계, 암기 모드, 시험지(PDF), 진행 상황 저장/불러오기
 """
+import base64
+import copy
 import glob
+import html as htmllib
 import io
 import json
 import os
@@ -12,7 +16,7 @@ import random
 import re
 import tempfile
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -28,7 +32,7 @@ except Exception as _e:  # 라이브러리가 없어도 뜻·음 문제는 풀 �
     HAS_CANVAS = False
     CANVAS_ERR = f"{type(_e).__name__}: {_e}"
 
-st.set_page_config(page_title="한자 퀴즈", page_icon="📖", layout="wide")
+st.set_page_config(page_title="한자 연습장", page_icon="📖", layout="wide", initial_sidebar_state="collapsed")
 
 # ----------------------------------------------------------------------
 # 폰트 (손글씨 비교용 정답 글자를 그리려면 한자가 들어 있는 폰트가 필요)
@@ -117,6 +121,7 @@ ALIASES = {
     "hanja": ["한자", "hanja", "char", "character", "漢字"],
     "meaning": ["뜻", "훈", "meaning", "의미"],
     "sound": ["음", "독음", "sound", "reading", "소리"],
+    "group": ["급수", "단원", "분류", "group", "level", "chapter", "category"],
 }
 
 
@@ -150,7 +155,7 @@ def parse_table(df):
     if df.empty:
         return []
     first = [x.strip().lower() for x in df.iloc[0]]
-    cols = {"hanja": 0, "meaning": 1, "sound": 2}
+    cols = {"hanja": 0, "meaning": 1, "sound": 2, "group": None}
     start = 0
     if not any(has_hanja(x) for x in first):  # 첫 줄이 헤더
         start = 1
@@ -165,7 +170,8 @@ def parse_table(df):
         def get(i):
             return vals[i].strip() if i < len(vals) else ""
 
-        rows.append((get(cols["hanja"]), get(cols["meaning"]), get(cols["sound"])))
+        grp = get(cols["group"]) if cols["group"] is not None else ""
+        rows.append((get(cols["hanja"]), get(cols["meaning"]), get(cols["sound"]), grp))
     return rows
 
 
@@ -191,7 +197,9 @@ def parse_file(f):
 
 def build_words(rows):
     words, seen, dropped = [], set(), 0
-    for h, m, s_ in rows:
+    for row in rows:
+        h, m, s_ = row[0], row[1], row[2]
+        g = row[3] if len(row) > 3 else ""
         h = h.strip()
         if not has_hanja(h) or not s_.strip():
             dropped += 1
@@ -199,7 +207,7 @@ def build_words(rows):
         if h in seen:
             continue
         seen.add(h)
-        words.append({"hanja": h, "meaning": m.strip(), "sound": s_.strip()})
+        words.append({"hanja": h, "meaning": m.strip(), "sound": s_.strip(), "group": str(g).strip()})
     return words, dropped
 
 
@@ -307,11 +315,25 @@ def render_char(ch, font_path, size=256, index=None):
     return img
 
 
+GRID_LINE = (232, 196, 192)  # 연한 붉은 점선 (채점 때 획으로 인식되지 않는 밝기)
+
+
+def grid_image(size=320):
+    """손글씨 칸에 깔아 두는 십자 점선(田字格). 글씨 균형을 잡는 데 도움이 돼요"""
+    base = Image.new("RGB", (size, size), (255, 255, 255))
+    d = ImageDraw.Draw(base)
+    c = size // 2
+    for t in range(0, size, 14):
+        d.line([(c, t), (c, min(t + 7, size))], fill=GRID_LINE, width=1)
+        d.line([(t, c), (min(t + 7, size), c)], fill=GRID_LINE, width=1)
+    return base
+
+
 def guide_image(ch, font_path, size=320):
     mask = np.array(render_char(ch, font_path, size)) > 127
-    base = np.full((size, size), 255, np.uint8)
-    base[mask] = 215  # 연한 회색 (채점 때 획으로 인식되지 않는 밝기)
-    return Image.fromarray(base).convert("RGB")
+    base = np.array(grid_image(size))
+    base[mask] = (215, 215, 215)  # 연한 회색 (채점 때 획으로 인식되지 않는 밝기)
+    return Image.fromarray(base)
 
 
 def thin(mask):
@@ -617,17 +639,92 @@ def grade_writing(image_data, ch, font_path, P, candidates=()):
 # ----------------------------------------------------------------------
 # 상태 관리
 # ----------------------------------------------------------------------
+INTERVALS = [0, 1, 3, 7, 14, 30]  # 복습 상자(0~5)별로 다음 복습까지 며칠 뒤인지
+BOX_LABELS = ["바로 복습", "1일 뒤", "3일 뒤", "7일 뒤", "14일 뒤", "30일 뒤"]
+TYPE_LABELS = {
+    "read": "뜻·음 쓰기",
+    "write": "한자 쓰기",
+    "choice_ko": "객관식 (한자→뜻·음)",
+    "choice_hj": "객관식 (뜻·음→한자)",
+}
+SETTING_DEFAULTS = dict(
+    set_type="섞어서", set_source="전체 단어", set_count=10, set_shuffle=True, set_groups=[],
+    set_goal=20, set_stroke=8,
+    card_src="전체 단어", card_dir="한자 → 뜻·음", card_shuffle=True, card_count=20,
+)
+KEEP_KEYS = list(SETTING_DEFAULTS)  # 화면에 없는 동안에도 값이 사라지지 않게 붙잡아 둘 설정들
+
+
+def esc(x):
+    return htmllib.escape(str(x))
+
+
+def today_str():
+    return date.today().isoformat()
+
+
 def init_state():
     defaults = dict(
         words=[], file_sig=None, quiz=[], pos=0, results=[], feedback=None,
         wrong={}, stats={}, nonce=0, retry_mode=False, hint=False, flash="",
-        progress_sig=None, calib=[], set_preset="보통",
+        progress_sig=None, calib=[], set_preset="보통", srs={}, history={}, cards=None, sheet=None,
     )
     defaults.update(GRADE_DEFAULTS)
+    defaults.update(SETTING_DEFAULTS)
     for k, v in defaults.items():
-        st.session_state.setdefault(k, list(v) if isinstance(v, list) else v)
+        st.session_state.setdefault(k, copy.deepcopy(v))
+    # 위젯이 화면에 없는 실행에서도 설정값이 지워지지 않게 다시 저장
+    for k in KEEP_KEYS:
+        st.session_state[k] = st.session_state[k]
 
 
+# --- 복습 주기 (간격 반복) ---------------------------------------------------
+def srs_update(key, ok):
+    """맞히면 상자가 한 칸 올라가 복습 간격이 늘고, 틀리면 0번 상자로 돌아와 바로 복습 대상이 돼요"""
+    s = st.session_state
+    e = s.srs.get(key, {"box": 0, "due": today_str(), "seen": 0})
+    box = min(e.get("box", 0) + 1, len(INTERVALS) - 1) if ok else 0
+    due = (date.today() + timedelta(days=INTERVALS[box])).isoformat()
+    s.srs[key] = {"box": box, "due": due, "seen": e.get("seen", 0) + 1}
+
+
+def due_pool(words):
+    """오늘 복습할 차례인 한자: 복습 날짜가 지난 것(약한 것 먼저) → 아직 안 풀어 본 것"""
+    s = st.session_state
+    today = today_str()
+    review, new = [], []
+    for w in words:
+        e = s.srs.get(w["hanja"])
+        if e is None:
+            new.append(w)
+        elif e.get("due", today) <= today:
+            review.append((e.get("box", 0), e.get("due", ""), w))
+    review.sort(key=lambda x: (x[0], x[1]))
+    random.shuffle(new)
+    return [w for _, _, w in review] + new
+
+
+def due_counts(words):
+    s = st.session_state
+    today = today_str()
+    new = sum(1 for w in words if w["hanja"] not in s.srs)
+    review = sum(1 for w in words if w["hanja"] in s.srs and s.srs[w["hanja"]].get("due", today) <= today)
+    return new, review
+
+
+# --- 날짜별 기록 ---------------------------------------------------------------
+def hist_add(day, right=0, wrong=0):
+    h = st.session_state.history.setdefault(day, {"right": 0, "wrong": 0})
+    h["right"] += right
+    h["wrong"] += wrong
+
+
+def hist_today():
+    h = st.session_state.history.get(today_str(), {})
+    return h.get("right", 0) + h.get("wrong", 0)
+
+
+# --- 문제 만들기 -----------------------------------------------------------------
 def reset_round(quiz, retry=False):
     s = st.session_state
     s.quiz, s.pos, s.results = quiz, 0, []
@@ -636,40 +733,98 @@ def reset_round(quiz, retry=False):
     s.nonce += 1
 
 
+def _label(w):
+    return f"{w['meaning']} {w['sound']}".strip()
+
+
+def make_choices(w, ty, n=4):
+    """보기 만들기: 같은 급수/단원의 한자를 먼저 오답 보기로 써서 헷갈리게 만들어요"""
+    s = st.session_state
+    others = [x for x in s.words if x["hanja"] != w["hanja"]]
+    if ty == "choice_hj":  # 뜻·음이 같은 다른 한자는 정답 시비가 생기니 제외
+        others = [x for x in others if _label(x) != _label(w)]
+    grp = w.get("group")
+    same = [x for x in others if grp and x.get("group") == grp]
+    rest = [x for x in others if not (grp and x.get("group") == grp)]
+    random.shuffle(same)
+    random.shuffle(rest)
+    key = (lambda x: _label(x)) if ty == "choice_ko" else (lambda x: x["hanja"])
+    seen, pick = {key(w)}, []
+    for x in same + rest:
+        if key(x) in seen:
+            continue
+        seen.add(key(x))
+        pick.append(x)
+        if len(pick) == n - 1:
+            break
+    opts = pick + [w]
+    random.shuffle(opts)
+    return [{"hanja": x["hanja"], "label": _label(x)} for x in opts]
+
+
+def make_item(w, ty):
+    item = {"w": w, "type": ty}
+    if ty in ("choice_ko", "choice_hj"):
+        item["opts"] = make_choices(w, ty)
+    return item
+
+
 def start_quiz():
     s = st.session_state
     source = s.get("set_source", "전체 단어")
-    pool = list(s.wrong.values()) if source == "오답 노트만" else list(s.words)
-    if not pool:
-        s.flash = "문제로 만들 단어가 없어요. 파일을 올리거나 오답 노트를 확인해 주세요."
-        return
     kind = s.get("set_type", "섞어서")
+    groups = s.get("set_groups", [])
+    if source == "오답 노트만":
+        pool = list(s.wrong.values())
+    else:
+        pool = [w for w in s.words if not groups or w.get("group") in groups]
+        if source == "오늘 복습할 것":
+            pool = due_pool(pool)
+    if not pool:
+        if source == "오늘 복습할 것":
+            s.flash = "오늘 복습할 한자가 없어요. 내일 다시 만나요! 🎉"
+        else:
+            s.flash = "문제로 만들 단어가 없어요. 파일을 올리거나 범위·오답 노트를 확인해 주세요."
+        return
+
+    many = len(s.words) >= 4  # 객관식은 보기를 만들려면 한자가 4개 이상 필요
     note = ""
     if kind in ("한자 쓰기", "섞어서") and not HAS_CANVAS:
         if kind == "한자 쓰기":
-            s.flash = (
-                "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못해서 시작할 수 없어요. "
-                "왼쪽 아래 '진단 정보'를 확인해 주세요."
-            )
+            s.flash = "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못해서 시작할 수 없어요. 왼쪽 메뉴의 '진단 정보'를 확인해 주세요."
             return
-        note = "⚠️ 한자 쓰기 기능을 불러오지 못해 뜻·음 문제만 나와요. (왼쪽 '진단 정보' 확인)"
-    items = []
-    for w in pool:
+        note = "⚠️ 한자 쓰기 기능을 불러오지 못해 손글씨 문제는 빠졌어요. (왼쪽 메뉴 '진단 정보' 확인)"
+    if kind == "객관식" and not many:
+        s.flash = "객관식은 단어장에 한자가 4개 이상 있어야 만들 수 있어요."
+        return
+
+    def pick_type(w):
         can_write = HAS_CANVAS and len(w["hanja"]) == 1
         if kind == "뜻·음 쓰기":
-            ty = "read"
-        elif kind == "한자 쓰기":
-            ty = "write" if can_write else None
-        else:
-            ty = random.choice(["read", "write"]) if can_write else "read"
+            return "read"
+        if kind == "한자 쓰기":
+            return "write" if can_write else None
+        if kind == "객관식":
+            return random.choice(["choice_ko", "choice_hj"])
+        opts = ["read"] + (["write"] if can_write else []) + (["choice_ko", "choice_hj"] if many else [])
+        return random.choice(opts)
+
+    shuffle = s.get("set_shuffle", True)
+    if shuffle and source != "오늘 복습할 것":
+        random.shuffle(pool)
+    count = int(s.get("set_count", 10))
+    items = []
+    for w in pool:
+        ty = pick_type(w)
         if ty:
-            items.append({"w": w, "type": ty})
-    if s.get("set_shuffle", True):
-        random.shuffle(items)
-    items = items[: int(s.get("set_count", 10))]
+            items.append(make_item(w, ty))
+        if len(items) >= count:
+            break
     if not items:
         s.flash = "선택한 유형으로 만들 수 있는 문제가 없어요. (한자 쓰기는 한 글자 한자만 가능)"
         return
+    if shuffle and source == "오늘 복습할 것":
+        random.shuffle(items)
     reset_round(items, retry=(source == "오답 노트만"))
     s.flash = note
 
@@ -677,7 +832,12 @@ def start_quiz():
 def record(w, qtype, ok, ans):
     s = st.session_state
     key = w["hanja"]
-    entry = {"w": w, "type": qtype, "correct": ok, "answer": ans, "added_wrong": False}
+    day = today_str()
+    prev = s.srs.get(key)
+    entry = {
+        "w": w, "type": qtype, "correct": ok, "answer": ans, "added_wrong": False,
+        "day": day, "srs_prev": dict(prev) if prev else None,
+    }
     st_ = s.stats.setdefault(key, {"meaning": w["meaning"], "sound": w["sound"], "right": 0, "wrong": 0})
     if ok:
         st_["right"] += 1
@@ -691,6 +851,8 @@ def record(w, qtype, ok, ans):
         e["wrong_count"] += 1
         e["last"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         entry["added_wrong"] = True
+    hist_add(day, right=int(ok), wrong=int(not ok))
+    srs_update(key, ok)
     s.results.append(entry)
 
 
@@ -710,6 +872,13 @@ def override_correct():
         s.wrong[key]["wrong_count"] -= 1
         if s.wrong[key]["wrong_count"] <= 0:
             del s.wrong[key]
+    hist_add(last.get("day", today_str()), right=1, wrong=-1)
+    prev = last.get("srs_prev")
+    if prev:
+        s.srs[key] = dict(prev)
+    else:
+        s.srs.pop(key, None)
+    srs_update(key, True)
     s.feedback["ok"] = True
     s.feedback["detail"] = "정정되었어요."
 
@@ -727,41 +896,342 @@ def reset_quiz():
     s.quiz, s.pos, s.results = [], 0, []
     s.feedback, s.hint = None, False
     s.nonce += 1
-    s.flash = "퀴즈를 초기화했어요. '시작'을 눌러 새로 시작하세요."
+    s.flash = "퀴즈를 마쳤어요. 설정을 바꿔서 다시 시작할 수 있어요."
 
 
 def reset_all():
-    """퀴즈 + 오답 노트 + 통계 전부 초기화 (불러온 단어는 유지)"""
+    """퀴즈 + 오답 노트 + 통계 + 복습 기록 전부 초기화 (불러온 단어는 유지)"""
     s = st.session_state
-    s.wrong, s.stats = {}, {}
+    s.wrong, s.stats, s.srs, s.history = {}, {}, {}, {}
+    s.cards = None
     reset_quiz()
     s.confirm_reset = False
-    s.flash = "퀴즈, 오답 노트, 통계를 모두 초기화했어요."
+    s.flash = "퀴즈, 오답 노트, 통계, 복습 기록을 모두 초기화했어요."
+
+
+# --- 플래시카드 ---------------------------------------------------------------
+def new_deck(pool):
+    deck = [{"hanja": w["hanja"], "meaning": w["meaning"], "sound": w["sound"]} for w in pool]
+    return {"deck": deck, "i": 0, "flip": False, "known": [], "unsure": []}
+
+
+def start_cards():
+    s = st.session_state
+    src = s.get("card_src", "전체 단어")
+    if src == "오답 노트만":
+        pool = list(s.wrong.values())
+    elif src == "오늘 복습할 것":
+        pool = due_pool(s.words)
+    else:
+        pool = list(s.words)
+    if not pool:
+        s.flash = "오늘 복습할 한자가 없어요. 🎉" if src == "오늘 복습할 것" else "카드로 만들 한자가 없어요."
+        return
+    if s.get("card_shuffle", True) and src != "오늘 복습할 것":
+        random.shuffle(pool)
+    s.cards = new_deck(pool[: int(s.get("card_count", 20))])
+    s.flash = ""
+
+
+def card_flip():
+    st.session_state.cards["flip"] = True
+
+
+def card_mark(known):
+    s = st.session_state
+    c = s.cards
+    cur = c["deck"][c["i"]]
+    (c["known"] if known else c["unsure"]).append(cur)
+    srs_update(cur["hanja"], known)
+    c["i"] += 1
+    c["flip"] = False
+
+
+def card_retry_unsure():
+    c = st.session_state.cards
+    st.session_state.cards = new_deck(c["unsure"])
+
+
+def card_close():
+    st.session_state.cards = None
 
 
 # ----------------------------------------------------------------------
-# 화면: 문제 풀기
+# 디자인 (CSS)
 # ----------------------------------------------------------------------
-def big(text, size=96):
-    st.markdown(
-        f"<div style='font-size:{size}px;text-align:center;line-height:1.2'>{text}</div>",
-        unsafe_allow_html=True,
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;700&family=Noto+Sans+KR:wght@400;500;700&display=swap');
+:root{
+  --ink:#1E2438; --indigo:#2B3A67; --jade:#2F7D6D; --seal:#B8372C;
+  --mist:#E7EBF2; --line:#D3D9E4; --soft:#5B6479; --grid:rgba(184,55,44,.38);
+  --serif:'Noto Serif KR','Noto Serif CJK KR','Batang','Songti SC',serif;
+}
+.stApp, .stApp .stMarkdown, .stApp label, .stApp button, .stApp input, .stApp textarea{
+  font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif;
+}
+.stApp h1,.stApp h2,.stApp h3{font-family:var(--serif); letter-spacing:-.01em;}
+.block-container{padding-top:4.2rem; padding-bottom:5rem; max-width:1000px;}
+
+/* 머리글 */
+.app-head{display:flex; align-items:center; gap:14px; margin:0 0 .6rem;}
+.app-head .seal{width:52px; height:52px; border-radius:10px; background:var(--seal); color:#fff;
+  display:grid; place-items:center; font:700 31px/1 var(--serif); transform:rotate(-3deg); flex:none;}
+.app-head .title{font:700 1.9rem/1.15 var(--serif); color:var(--ink);}
+.app-head .sub{color:var(--soft); font-size:.95rem; margin-top:2px;}
+.chips{display:flex; flex-wrap:wrap; gap:8px; margin:.2rem 0 .7rem;}
+.chip{display:inline-flex; align-items:center; gap:6px; padding:.3rem .85rem; border-radius:999px;
+  background:var(--mist); color:var(--ink); font-weight:500; font-size:.95rem;}
+.chip.hot{background:#F7E3E0; color:var(--seal);}
+.chip.good{background:#DCEEE9; color:var(--jade);}
+
+/* 터치 친화 */
+.stButton>button,.stDownloadButton>button{min-height:3.1rem; border-radius:12px; font-weight:500; font-size:1.02rem;}
+.stTabs [data-baseweb="tab-list"]{gap:.2rem;}
+.stTabs [data-baseweb="tab"]{height:3.2rem; padding:0 1.05rem; font-size:1.02rem;}
+.stRadio label p, .stCheckbox label p, .stToggle label p{font-size:1.02rem;}
+.stRadio [role="radiogroup"]{gap:.5rem;}
+.stRadio [role="radiogroup"] label{padding:.5rem 1rem; margin:0; border:1.5px solid var(--line); border-radius:999px; background:#fff;}
+.stRadio [role="radiogroup"] label:has(input:checked){border-color:var(--indigo); background:#E9EDF8;}
+.app-head.compact{margin-bottom:.2rem;}
+.app-head.compact .seal{width:38px; height:38px; font-size:23px; border-radius:8px;}
+.app-head.compact .title{font-size:1.35rem;}
+
+/* 한자 카드: 십자 점선 칸 */
+.hj-card{width:min(240px,70vw); aspect-ratio:1/1; margin:.2rem auto .8rem; display:flex; align-items:center;
+  justify-content:center; font-family:var(--serif); font-weight:500; color:var(--ink); line-height:1;
+  background:
+    repeating-linear-gradient(to bottom,var(--grid) 0 6px,transparent 6px 12px) center/1px 100% no-repeat,
+    repeating-linear-gradient(to right,var(--grid) 0 6px,transparent 6px 12px) center/100% 1px no-repeat,
+    #fff;
+  border:2px solid var(--indigo); border-radius:6px;}
+.hj-card.wide{aspect-ratio:auto; width:fit-content; min-width:min(240px,70vw); max-width:100%;
+  padding:1.2rem 1.2rem; background:#fff;}
+.mean-card{max-width:520px; margin:.3rem auto .8rem; padding:1.1rem 1rem; text-align:center; background:#fff;
+  border:2px solid var(--indigo); border-radius:6px; font-family:var(--serif); font-size:2rem; line-height:1.35; color:var(--ink);}
+.mean-card b{display:block; font-size:2.3rem; margin-top:.15rem; color:var(--indigo);}
+.ask{text-align:center; color:var(--soft); margin:.1rem 0 .9rem; font-size:1.05rem;}
+
+/* 결과: 도장 */
+.fb-row{display:flex; align-items:center; justify-content:center; gap:1.4rem; flex-wrap:wrap; margin:.6rem 0 1rem;}
+.verdict{display:inline-block; padding:.3rem 1.1rem; border:3px solid; border-radius:10px;
+  font:700 1.7rem/1.2 var(--serif); transform:rotate(-4deg); letter-spacing:.05em;}
+.verdict.ok{color:var(--jade); border-color:var(--jade);}
+.verdict.no{color:var(--seal); border-color:var(--seal);}
+.reveal{display:flex; align-items:center; gap:1rem; padding:.8rem 1.3rem; border:1px solid var(--line);
+  border-radius:10px; background:#fff;}
+.reveal .rh{font:500 3.2rem/1 var(--serif); color:var(--ink);}
+.reveal .rm{font-size:1.15rem; color:var(--ink);}
+.reveal .rm b{font:700 1.5rem var(--serif);}
+
+/* 객관식 버튼 */
+.st-key-choices_ko button,.st-key-choices_hj button{min-height:4.4rem; background:#fff; border:1.5px solid var(--line);}
+.st-key-choices_ko button p{font-size:1.3rem;}
+.st-key-choices_hj button p{font-family:var(--serif); font-size:2.6rem; line-height:1.1;}
+
+/* 단어장 */
+.wgrid{display:grid; grid-template-columns:repeat(auto-fill,minmax(128px,1fr)); gap:12px; margin-top:.6rem;}
+.wcard{background:#fff; border:1px solid var(--line); border-radius:10px; padding:.7rem .4rem .6rem; text-align:center;}
+.wcard .h{font:500 2.6rem/1.1 var(--serif); color:var(--ink);}
+.wcard .m{font-size:.95rem; color:var(--soft); margin-top:.25rem; min-height:1.3em;}
+.wcard .m b{color:var(--ink);}
+.wcard details summary{cursor:pointer; color:var(--indigo); font-size:.9rem; list-style:none; padding:.25rem 0;}
+.wcard details summary::-webkit-details-marker{display:none;}
+.wcard .g{font-size:.75rem; color:var(--soft);}
+
+/* 결과 요약 */
+.score-box{text-align:center; padding:1.2rem; border:2px solid var(--indigo); border-radius:6px; background:#fff; margin-bottom:1rem;}
+.score-box .big{font:700 3.2rem/1.1 var(--serif); color:var(--indigo);}
+.score-box .lbl{color:var(--soft);}
+</style>
+"""
+
+
+def inject_css():
+    st.markdown(CSS, unsafe_allow_html=True)
+
+
+def html(s):
+    st.markdown(s, unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------
+# 공통 조각
+# ----------------------------------------------------------------------
+def hanja_card(text):
+    n = len(text)
+    size = {1: 128, 2: 92, 3: 70}.get(n, 54)
+    cls = "hj-card" if n == 1 else "hj-card wide"
+    html(f"<div class='{cls}' style='font-size:min({size}px,24vw)'>{esc(text)}</div>")
+
+
+def meaning_card(w):
+    html(f"<div class='mean-card'>{esc(w['meaning'])}<b>{esc(w['sound'])}</b></div>")
+
+
+def reveal(w):
+    html(
+        f"<div class='reveal'><div class='rh'>{esc(w['hanja'])}</div>"
+        f"<div class='rm'>{esc(w['meaning'])} <b>{esc(w['sound'])}</b></div></div>"
     )
 
 
+def verdict_row(ok, w, extra=""):
+    cls, txt = ("ok", "정답") if ok else ("no", "오답")
+    html(
+        f"<div class='fb-row'><div class='verdict {cls}'>{txt}</div>"
+        f"<div class='reveal'><div class='rh'>{esc(w['hanja'])}</div>"
+        f"<div class='rm'>{esc(w['meaning'])} <b>{esc(w['sound'])}</b>{extra}</div></div></div>"
+    )
+
+
+def streak_now(results):
+    n = 0
+    for r in reversed(results):
+        if not r["correct"]:
+            break
+        n += 1
+    return n
+
+
+# ----------------------------------------------------------------------
+# 화면: 머리글 / 시작 화면
+# ----------------------------------------------------------------------
+def header():
+    s = st.session_state
+    playing = bool(s.quiz) and s.pos < len(s.quiz)  # 문제 푸는 중엔 머리글을 줄여서 화면을 아껴요
+    sub = "" if playing else "<div class='sub'>쓰고, 고르고, 넘겨 보며 익혀요</div>"
+    html(
+        f"<div class='app-head{' compact' if playing else ''}'><div class='seal'>漢</div>"
+        f"<div><div class='title'>한자 연습장</div>{sub}</div></div>"
+    )
+    if not s.words or playing:
+        return
+    new, review = due_counts(s.words)
+    goal = max(1, int(s.get("set_goal", 20)))
+    done = hist_today()
+    chips = [f"<span class='chip'>📚 한자 {len(s.words)}개</span>"]
+    if review:
+        chips.append(f"<span class='chip hot'>🔁 복습할 차례 {review}개</span>")
+    if new:
+        chips.append(f"<span class='chip'>🌱 아직 안 푼 {new}개</span>")
+    if s.wrong:
+        chips.append(f"<span class='chip'>📕 오답 노트 {len(s.wrong)}개</span>")
+    html("<div class='chips'>" + "".join(chips) + "</div>")
+    st.progress(min(1.0, done / goal), text=f"오늘의 목표 {done} / {goal}문제" + (" 🎉 달성!" if done >= goal else ""))
+
+
+SAMPLE_CSV = (
+    "한자,뜻,음,분류\n"
+    "天,하늘,천,자연\n地,땅,지,자연\n山,메,산,자연\n水,물,수,자연\n火,불,화,자연\n"
+    "日,날,일,자연\n月,달,월,자연\n木,나무,목,자연\n金,쇠,금,자연\n土,흙,토,자연\n"
+    "一,한,일,숫자\n二,두,이,숫자\n三,석,삼,숫자\n四,넉,사,숫자\n五,다섯,오,숫자\n六,여섯,육/륙,숫자\n"
+    "人,사람,인,사람\n女,계집,녀/여,사람\n男,사내,남,사람\n子,아들,자,사람\n父,아비,부,사람\n母,어미,모,사람\n"
+)
+
+
+def load_panel():
+    """단어장 불러오기 (파일 업로드 / 직접 붙여넣기). 단어장이 없을 땐 시작 화면에, 있을 땐 사이드바에 나와요"""
+    s = st.session_state
+    f = st.file_uploader("한자 파일 (txt / csv / xlsx)", key="wordfile")  # 형식 제한 없음: 태블릿 호환
+    st.download_button("샘플 CSV 받기", SAMPLE_CSV.encode("utf-8-sig"), "sample_hanja.csv", "text/csv")
+    st.caption("한 줄에 '한자, 뜻, 음'. 4번째 열에 '급수/단원/분류'를 넣으면 범위를 골라 풀 수 있어요.")
+    if f is not None:
+        sig = (f.name, f.size)
+        if sig != s.file_sig:
+            try:
+                words, dropped = parse_file(f)
+                s.words, s.file_sig = words, sig
+                s.quiz, s.cards = [], None
+                s.flash = f"{len(words)}개 한자를 불러왔어요." + (
+                    f" (뜻·음이 없어서 제외한 줄 {dropped}개)" if dropped else ""
+                )
+            except Exception as e:
+                s.flash = f"파일을 읽지 못했어요: {e}"
+    with st.expander("✍️ 텍스트 직접 붙여넣기 (파일이 안 될 때)"):
+        pasted = st.text_area("한 줄에 '한자 뜻 음' (예: 天 하늘 천)", height=150, key="paste_text")
+        if st.button("붙여넣은 내용 적용"):
+            words, dropped = build_words(parse_text(pasted))
+            if words:
+                s.words, s.quiz, s.cards = words, [], None
+                s.file_sig = (f.name, f.size) if f is not None else None  # 업로드 파일이 덮어쓰지 않게
+                s.flash = f"{len(words)}개 한자를 불러왔어요."
+            else:
+                s.flash = "읽을 수 있는 줄이 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요."
+
+
+def render_welcome():
+    st.subheader("단어장을 불러와 볼까요?")
+    st.write("한자·뜻·음이 적힌 파일을 올리면 문제, 카드, 시험지가 자동으로 만들어져요.")
+    load_panel()
+    st.caption("파일이 없다면 위의 '샘플 CSV 받기'로 받은 뒤 다시 올려서 먼저 둘러볼 수 있어요.")
+
+
+# ----------------------------------------------------------------------
+# 화면: 연습 (설정 → 문제 → 결과)
+# ----------------------------------------------------------------------
+def render_home():
+    s = st.session_state
+    st.subheader("오늘은 무엇을 연습할까요?")
+    new, review = due_counts(s.words)
+    st.radio("문제 유형", ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"], key="set_type", horizontal=True,
+             help="뜻·음 쓰기: 키보드로 입력 / 한자 쓰기: 손글씨 / 객관식: 4개 중 고르기")
+    st.radio("문제 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="set_source", horizontal=True,
+             help=f"'오늘 복습할 것'은 복습 날짜가 된 한자({review}개)와 아직 안 푼 한자({new}개)를 약한 것부터 골라줘요.")
+    groups = sorted({w["group"] for w in s.words if w.get("group")})
+    if groups:
+        s.set_groups = [g for g in s.set_groups if g in groups]
+        st.multiselect("급수/단원/분류 (비워 두면 전체)", groups, key="set_groups", placeholder="전체 (눌러서 고르기)")
+    c1, c2 = st.columns([3, 2])
+    c1.slider("문제 수", 5, 100, step=5, key="set_count")
+    with c2:
+        st.write("")
+        st.toggle("순서 섞기", key="set_shuffle")
+    st.button("▶️ 시작하기", type="primary", on_click=start_quiz, width="stretch")
+    if s.get("set_type") in ("한자 쓰기", "섞어서") and not find_font():
+        st.caption("한자 폰트를 찾지 못해 손글씨는 자가 채점으로 진행돼요.")
+
+
+def render_practice():
+    s = st.session_state
+    if not s.quiz:
+        render_home()
+        return
+    if s.pos >= len(s.quiz):
+        render_summary()
+        return
+    q = s.quiz[s.pos]
+    st.progress(s.pos / len(s.quiz), text=f"{s.pos + 1} / {len(s.quiz)}  ·  {TYPE_LABELS[q['type']]}")
+    streak = streak_now(s.results)
+    chips = [f"<span class='chip'>현재 점수 {sum(r['correct'] for r in s.results)} / {len(s.results)}</span>"]
+    if streak >= 2:
+        chips.append(f"<span class='chip good'>🔥 {streak}연속 정답</span>")
+    html("<div class='chips'>" + "".join(chips) + "</div>")
+    if s.feedback:
+        render_feedback(q)
+    elif q["type"] == "read":
+        render_read(q["w"])
+    elif q["type"] == "write":
+        render_write(q["w"])
+    else:
+        render_choice(q)
+    if not s.feedback:
+        st.button("그만하기", key="quit_quiz", on_click=reset_quiz)
+
+
+# --- 뜻·음 쓰기 ---------------------------------------------------------------
 def render_read(w):
     s = st.session_state
-    with st.chat_message("assistant", avatar="📖"):
-        big(w["hanja"])
-        st.write("이 한자의 **뜻과 음**을 입력하세요. 예) 하늘 천")
-        if s.hint:
-            first_mean = split_alts(w["meaning"])[0] if split_alts(w["meaning"]) else ""
-            st.caption(f"💡 음은 '{w['sound'][0]}'(으)로 시작하고, 뜻은 {len(first_mean)}글자예요.")
-    c1, c2, _ = st.columns([1, 1, 4])
-    if c1.button("💡 힌트"):
+    hanja_card(w["hanja"])
+    html("<div class='ask'>이 한자의 <b>뜻과 음</b>을 입력하세요. 예) 하늘 천</div>")
+    if s.hint:
+        first_mean = split_alts(w["meaning"])[0] if split_alts(w["meaning"]) else ""
+        st.caption(f"💡 음은 '{w['sound'][0]}'(으)로 시작하고, 뜻은 {len(first_mean)}글자예요.")
+    c1, c2, _ = st.columns([1, 1, 2])
+    if c1.button("💡 힌트", width="stretch"):
         s.hint = True
         st.rerun()
-    if c2.button("모르겠어요", key="skip_read"):
+    if c2.button("모르겠어요", key="skip_read", width="stretch"):
         finish_read(w, "")
     ans = st.chat_input("뜻과 음을 입력하세요 (예: 하늘 천)")
     if ans:
@@ -776,53 +1246,106 @@ def finish_read(w, ans):
     st.rerun()
 
 
-def draw_canvas(bg, key):
+# --- 객관식 -------------------------------------------------------------------
+def render_choice(q):
     s = st.session_state
-    kwargs = dict(
-        fill_color="rgba(255,255,255,0)",
-        stroke_width=int(s.get("set_stroke", 8)),
-        stroke_color="#000000",
-        background_color="#FFFFFF",
-        height=320,
-        width=320,
-        drawing_mode="freedraw",
-        key=key,
+    w, ty = q["w"], q["type"]
+    if ty == "choice_ko":
+        hanja_card(w["hanja"])
+        html("<div class='ask'>이 한자의 <b>뜻과 음</b>은?</div>")
+    else:
+        meaning_card(w)
+        html("<div class='ask'>이 뜻·음에 해당하는 <b>한자</b>는?</div>")
+    with st.container(key="choices_ko" if ty == "choice_ko" else "choices_hj"):
+        cols = st.columns(2)
+        for i, o in enumerate(q["opts"]):
+            text = o["label"] if ty == "choice_ko" else o["hanja"]
+            cols[i % 2].button(text, key=f"opt_{s.pos}_{s.nonce}_{i}", on_click=answer_choice,
+                               args=(w, ty, o), width="stretch")
+    st.button("모르겠어요", key="skip_choice", on_click=answer_choice, args=(w, ty, None))
+
+
+def answer_choice(w, ty, o):
+    s = st.session_state
+    ok = o is not None and o["hanja"] == w["hanja"]
+    if o is None:
+        shown, detail = "(모르겠어요)", ""
+    else:
+        shown = o["hanja"] if ty == "choice_hj" else o["label"]
+        detail = ""
+        if not ok:
+            detail = (f"고른 '{o['label']}'은(는) {o['hanja']}의 뜻·음이에요." if ty == "choice_ko"
+                      else f"고른 {o['hanja']}은(는) '{o['label']}'이에요.")
+    record(w, ty, ok, shown)
+    s.feedback = {"type": "read", "user": shown, "ok": ok, "detail": detail, "choice": True}
+
+
+# --- 한자 쓰기 ----------------------------------------------------------------
+CANVAS_PX = 360
+
+
+def flatten(data):
+    """캔버스 이미지(RGBA)를 흰 바탕에 합성해요. 배경이 투명해도 빈 곳이 '검은 획'으로 읽히지 않게 하는 안전장치"""
+    a = data[:, :, 3:4].astype(float) / 255.0
+    rgb = data[:, :, :3].astype(float) * a + 255.0 * (1.0 - a)
+    out = np.dstack([rgb, np.full(data.shape[:2], 255.0)])
+    return out.astype(np.uint8)
+
+
+def canvas_backdrop(img):
+    """캔버스 뒤쪽 칸(iframe)에 십자 점선·힌트 글씨를 CSS 배경으로 깔아요. 캔버스 자체는 투명해서 채점에는 영향이 없어요"""
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    html(
+        "<style>.st-key-canvas_box{width:412px; max-width:100%; background:url(" + uri + ") 0 0 / "
+        f"{CANVAS_PX}px {CANVAS_PX}px no-repeat;}}"
+        ".st-key-canvas_box iframe{mix-blend-mode:multiply;}</style>"
     )
-    err = None
+
+
+def draw_canvas(key):
+    s = st.session_state
     try:
-        return st_canvas(background_image=bg, **kwargs)
+        return st_canvas(
+            fill_color="rgba(255,255,255,0)",
+            stroke_width=int(s.get("set_stroke", 8)),
+            stroke_color="#000000",
+            background_color="",
+            height=CANVAS_PX,
+            width=CANVAS_PX,
+            drawing_mode="freedraw",
+            key=key,
+        )
     except Exception as e:
-        err = e
-    if bg is not None:  # 가이드(배경 이미지)가 문제일 수 있어 끄고 재시도
-        st.warning("이 환경에서는 연한 글씨 가이드가 동작하지 않아 끄고 진행해요.")
-        try:
-            return st_canvas(background_image=None, **kwargs)
-        except Exception as e2:
-            err = e2
-    st.error(f"캔버스를 표시하지 못했어요: {type(err).__name__}: {err}")
-    return None
+        st.error(f"캔버스를 표시하지 못했어요: {type(e).__name__}: {e}")
+        return None
 
 
 def render_write(w):
     s = st.session_state
     font = find_font()
-    st.markdown(f"### ✍️ **{w['meaning']} {w['sound']}** 에 해당하는 한자를 쓰세요")
-    hint = st.checkbox("연한 글씨 가이드 보기 (힌트)", key=f"hint_{s.pos}_{s.nonce}", disabled=font is None)
-    bg = guide_image(w["hanja"], font) if (hint and font) else None
-    left, _ = st.columns([1, 1])
+    left, right = st.columns([1, 1])
     with left:
-        res = draw_canvas(bg, f"cv_{s.pos}_{s.nonce}_{int(hint)}")
-    b1, b2, b3, _ = st.columns([1, 1, 1, 3])
-    if b1.button("제출", type="primary"):
-        data = res.image_data if res is not None else None
+        meaning_card(w)
+        html("<div class='ask'>에 해당하는 한자를 오른쪽 칸에 쓰세요</div>")
+        hint = st.checkbox("연한 글씨 가이드 보기 (힌트)", key=f"hint_{s.pos}_{s.nonce}", disabled=font is None)
+    # 십자 점선은 항상 깔고, 힌트를 켜면 정답 글자가 연한 회색으로 같이 나와요
+    canvas_backdrop(guide_image(w["hanja"], font, CANVAS_PX) if (hint and font) else grid_image(CANVAS_PX))
+    with right:
+        with st.container(key="canvas_box"):
+            res = draw_canvas(f"cv_{s.pos}_{s.nonce}_{int(hint)}")
+    b1, b2, b3 = st.columns(3)
+    if b1.button("제출", type="primary", width="stretch"):
+        data = flatten(res.image_data) if (res is not None and res.image_data is not None) else None
         if data is None or (data[:, :, :3].astype(float).mean(axis=2) < 110).sum() < 30:
             st.warning("먼저 한자를 써 주세요.")
         else:
             submit_write(w, data, font)
-    if b2.button("지우기"):
+    if b2.button("지우기", width="stretch"):
         s.nonce += 1
         st.rerun()
-    if b3.button("모르겠어요", key="skip_write"):
+    if b3.button("모르겠어요", key="skip_write", width="stretch"):
         record(w, "write", False, "")
         s.feedback = {"type": "write", "ok": False, "pending": False, "score": None, "overlay": None}
         st.rerun()
@@ -856,48 +1379,43 @@ def self_grade(w, ok):
     st.rerun()
 
 
+# --- 결과 화면 ----------------------------------------------------------------
 def render_feedback(q):
     s = st.session_state
     fb, w = s.feedback, q["w"]
     if fb["type"] == "read":
         with st.chat_message("user"):
             st.write(fb["user"])
-        with st.chat_message("assistant", avatar="📖"):
-            if fb["ok"]:
-                st.success("정답! 🎉")
-            else:
-                st.error("오답이에요.")
-            st.markdown(f"정답: **{w['hanja']} = {w['meaning']} {w['sound']}**")
-            if fb.get("detail"):
-                st.caption(fb["detail"])
+        verdict_row(fb["ok"], w)
+        if fb.get("detail"):
+            st.caption(fb["detail"])
     else:
-        big(w["hanja"], 110)
-        st.markdown(f"<div style='text-align:center'>{w['meaning']} {w['sound']}</div>", unsafe_allow_html=True)
         if fb["pending"]:
+            hanja_card(w["hanja"])
+            html(f"<div class='ask'>{esc(w['meaning'])} {esc(w['sound'])}</div>")
             st.info("정답 한자와 내 글씨를 비교해서 직접 채점해 주세요. (서버에 한자 폰트가 없어 자동 채점이 꺼져 있어요)")
-            g1, g2, _ = st.columns([1, 1, 4])
-            if g1.button("⭕ 맞았어요"):
+            g1, g2, _ = st.columns([1, 1, 2])
+            if g1.button("⭕ 맞았어요", width="stretch"):
                 self_grade(w, True)
-            if g2.button("❌ 틀렸어요"):
+            if g2.button("❌ 틀렸어요", width="stretch"):
                 self_grade(w, False)
             return
-        if fb["ok"]:
-            st.success("정답! 🎉" + (f"  (유사도 {fb['score']:.2f})" if fb["score"] is not None else ""))
-        else:
-            st.error("오답이에요." + (f"  (유사도 {fb['score']:.2f})" if fb["score"] is not None else ""))
-        if fb.get("p") is not None:
-            line = (f"내 글씨가 정답과 맞는 정도 {fb['p']:.0%} · 정답 획을 채운 정도 {fb['r']:.0%}"
-                    f" · 가장 크게 어긋난 획 {fb['gap']:.0f}%")
-            if fb.get("other"):
-                line += f" · 가장 비슷한 다른 글자 '{fb['other'][0]}' {fb['other'][1]:.2f}"
-            st.caption(line)
+        extra = f"<span style='color:#5B6479;font-size:.9rem'> · 유사도 {fb['score']:.2f}</span>" if fb["score"] is not None else ""
+        verdict_row(fb["ok"], w, extra)
         if fb.get("overlay") is not None:
             st.image(fb["overlay"], caption="빨강: 정답 글자 / 파랑: 내 글씨 / 보라: 겹친 부분", width=256)
         if fb.get("detail"):
             st.caption(fb["detail"])
-    if not fb["ok"] and not fb.get("pending"):
+        if fb.get("p") is not None:
+            with st.expander("채점 자세히 보기"):
+                line = (f"내 글씨가 정답과 맞는 정도 {fb['p']:.0%} · 정답 획을 채운 정도 {fb['r']:.0%}"
+                        f" · 가장 크게 어긋난 획 {fb['gap']:.0f}%")
+                if fb.get("other"):
+                    line += f" · 가장 비슷한 다른 글자 '{fb['other'][0]}' {fb['other'][1]:.2f}"
+                st.caption(line)
+    if not fb["ok"] and not fb.get("pending") and not fb.get("choice"):
         st.button("🙋 내가 맞게 썼어요 (정정)", on_click=override_correct)
-    st.button("다음 문제 ➡️", type="primary", on_click=next_question)
+    st.button("다음 문제 ➡️", type="primary", on_click=next_question, width="stretch")
 
 
 def render_summary():
@@ -905,17 +1423,22 @@ def render_summary():
     res = s.results
     n = len(res)
     c = sum(r["correct"] for r in res)
-    st.subheader("🎉 결과")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("점수", f"{c} / {n}")
-    m2.metric("정답률", f"{(c / n * 100 if n else 0):.0f}%")
-    m3.metric("오답 노트 누적", len(s.wrong))
+    best, cur = 0, 0
+    for r in res:
+        cur = cur + 1 if r["correct"] else 0
+        best = max(best, cur)
+    st.subheader("수고했어요! 결과예요")
+    rate = c / n * 100 if n else 0
+    html(f"<div class='score-box'><div class='big'>{c} / {n}</div><div class='lbl'>정답률 {rate:.0f}%</div></div>")
+    m1, m2 = st.columns(2)
+    m1.metric("최고 연속 정답", f"{best}개")
+    m2.metric("오답 노트 누적", len(s.wrong))
     if n:
         df = pd.DataFrame(
             [
                 {
                     "결과": "⭕" if r["correct"] else "❌",
-                    "유형": "뜻·음" if r["type"] == "read" else "한자 쓰기",
+                    "유형": TYPE_LABELS.get(r["type"], r["type"]),
                     "한자": r["w"]["hanja"],
                     "뜻": r["w"]["meaning"],
                     "음": r["w"]["sound"],
@@ -925,15 +1448,74 @@ def render_summary():
             ]
         )
         st.dataframe(df, width="stretch", hide_index=True)
-    wrong_items = [{"w": r["w"], "type": r["type"]} for r in res if not r["correct"]]
-    b1, b2, _ = st.columns([1, 1.4, 3])
-    b1.button("🔁 새로 시작", on_click=start_quiz)
+    wrong_items = [make_item(r["w"], r["type"]) for r in res if not r["correct"]]
+    b1, b2 = st.columns(2)
+    b1.button("🔁 새로 시작", on_click=start_quiz, width="stretch")
     if wrong_items:
-        b2.button("❌ 이번에 틀린 것만 다시", on_click=reset_round, args=(wrong_items, False))
+        b2.button("❌ 이번에 틀린 것만 다시", on_click=reset_round, args=(wrong_items, False), width="stretch")
+    st.button("설정 바꾸기", on_click=reset_quiz)
 
 
 # ----------------------------------------------------------------------
-# 화면: 오답 노트 / 통계 / 단어장
+# 화면: 카드
+# ----------------------------------------------------------------------
+def render_cards():
+    s = st.session_state
+    c = s.cards
+    if c is None:
+        st.subheader("카드로 넘겨 보며 익혀요")
+        st.write("카드를 보고 떠올린 뒤 뒤집어서 확인하세요. '알아요/헷갈려요'는 복습 주기에 반영돼요.")
+        st.radio("카드 앞면", ["한자 → 뜻·음", "뜻·음 → 한자"], key="card_dir", horizontal=True)
+        st.radio("카드 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="card_src", horizontal=True)
+        a, b = st.columns([3, 2])
+        a.slider("카드 수", 5, 100, step=5, key="card_count")
+        with b:
+            st.write("")
+            st.toggle("순서 섞기", key="card_shuffle")
+        st.button("🃏 카드 시작", type="primary", on_click=start_cards, width="stretch")
+        return
+    deck, i = c["deck"], c["i"]
+    if i >= len(deck):
+        st.subheader("카드를 다 봤어요")
+        k, u = len(c["known"]), len(c["unsure"])
+        html(f"<div class='chips'><span class='chip good'>알아요 {k}개</span><span class='chip hot'>헷갈려요 {u}개</span></div>")
+        if u:
+            html("<div class='ask'>헷갈린 한자</div>")
+            html("<div class='wgrid'>" + "".join(
+                f"<div class='wcard'><div class='h'>{esc(w['hanja'])}</div><div class='m'><b>{esc(w['meaning'])}</b> {esc(w['sound'])}</div></div>"
+                for w in c["unsure"]) + "</div>")
+        b1, b2 = st.columns(2)
+        if u:
+            b1.button("🔁 헷갈린 것만 다시", on_click=card_retry_unsure, width="stretch")
+        b2.button("끝내기", on_click=card_close, width="stretch")
+        return
+    cur = deck[i]
+    st.progress(i / len(deck), text=f"{i + 1} / {len(deck)}")
+    front_is_hanja = s.get("card_dir", "한자 → 뜻·음") == "한자 → 뜻·음"
+    if not c["flip"]:
+        hanja_card(cur["hanja"]) if front_is_hanja else meaning_card(cur)
+        html("<div class='ask'>떠올려 보고 뒤집어 확인하세요</div>")
+        st.button("🔄 뒤집기", type="primary", on_click=card_flip, width="stretch", key="card_flip")
+    else:
+        hanja_card(cur["hanja"])
+        verdict_row_neutral(cur)
+        b1, b2 = st.columns(2)
+        b1.button("😊 알아요", on_click=card_mark, args=(True,), width="stretch", type="primary", key="card_known")
+        b2.button("🤔 헷갈려요", on_click=card_mark, args=(False,), width="stretch", key="card_unsure")
+    st.button("그만 보기", key="card_quit", on_click=card_close)
+
+
+def verdict_row_neutral(w):
+    html(f"<div class='fb-row'>{reveal_html(w)}</div>")
+
+
+def reveal_html(w):
+    return (f"<div class='reveal'><div class='rh'>{esc(w['hanja'])}</div>"
+            f"<div class='rm'>{esc(w['meaning'])} <b>{esc(w['sound'])}</b></div></div>")
+
+
+# ----------------------------------------------------------------------
+# 화면: 오답 노트 / 기록 / 단어장
 # ----------------------------------------------------------------------
 def render_wrong():
     s = st.session_state
@@ -948,22 +1530,23 @@ def render_wrong():
     ).sort_values("틀린 횟수", ascending=False)
     st.dataframe(df, width="stretch", hide_index=True)
     sel = st.multiselect("오답 노트에서 뺄 한자", list(s.wrong.keys()))
-    c1, c2, c3, c4 = st.columns(4)
-    if c1.button("선택 삭제") and sel:
+    c1, c2, c3 = st.columns(3)
+    if c1.button("선택 삭제", width="stretch") and sel:
         for k in sel:
             s.wrong.pop(k, None)
         st.rerun()
-    if c2.button("전체 비우기"):
+    if c2.button("전체 비우기", width="stretch"):
         s.wrong.clear()
         st.rerun()
-    c3.download_button("CSV로 저장", df.to_csv(index=False).encode("utf-8-sig"), "오답노트.csv", "text/csv")
+    c3.download_button("CSV로 저장", df.to_csv(index=False).encode("utf-8-sig"), "오답노트.csv", "text/csv", width="stretch")
 
     def go_wrong():
         s.set_source = "오답 노트만"
+        s.set_type = "섞어서"
         start_quiz()
 
-    c4.button("📝 오답으로 바로 풀기", on_click=go_wrong)
-    st.caption("오답 노트 모드에서 맞히면 노트에서 자동으로 빠져요. 풀이는 '문제 풀기' 탭에서 진행돼요.")
+    st.button("📝 오답으로 바로 풀기", type="primary", on_click=go_wrong, width="stretch")
+    st.caption("오답 노트 모드에서 맞히면 노트에서 자동으로 빠져요. 풀이는 '연습' 탭에서 진행돼요.")
 
 
 def render_stats():
@@ -979,30 +1562,182 @@ def render_stats():
              "정답률(%)": round(v["right"] / tot * 100) if tot else 0}
         )
     df = pd.DataFrame(rows).sort_values("정답률(%)")
-    tr, tw = df["맞음"].sum(), df["틀림"].sum()
+    tr, tw = int(df["맞음"].sum()), int(df["틀림"].sum())
     a, b, c = st.columns(3)
-    a.metric("푼 문제", int(tr + tw))
-    b.metric("전체 정답률", f"{tr / (tr + tw) * 100:.0f}%")
-    c.metric("약한 한자(정답률 50% 미만)", int((df["정답률(%)"] < 50).sum()))
-    st.dataframe(df, width="stretch", hide_index=True)
-    st.bar_chart(df.set_index("한자")[["맞음", "틀림"]])
+    a.metric("푼 문제", tr + tw)
+    b.metric("전체 정답률", f"{tr / (tr + tw) * 100:.0f}%" if tr + tw else "-")
+    c.metric("약한 한자 (정답률 50% 미만)", int((df["정답률(%)"] < 50).sum()))
+
+    if s.history:
+        st.markdown("##### 최근 14일")
+        days = [(date.today() - timedelta(days=d)).isoformat() for d in range(13, -1, -1)]
+        hd = pd.DataFrame(
+            {"맞음": [s.history.get(d, {}).get("right", 0) for d in days],
+             "틀림": [s.history.get(d, {}).get("wrong", 0) for d in days]},
+            index=[d[5:] for d in days],
+        )
+        st.bar_chart(hd, color=["#2F7D6D", "#B8372C"], sort=False)
+
+    weak = df[df["틀림"] > 0].sort_values(["정답률(%)", "틀림"], ascending=[True, False]).head(10)
+    if len(weak):
+        st.markdown("##### 가장 약한 한자 TOP 10")
+        html("<div class='wgrid'>" + "".join(
+            f"<div class='wcard'><div class='h'>{esc(r['한자'])}</div>"
+            f"<div class='m'><b>{esc(r['뜻'])}</b> {esc(r['음'])}</div>"
+            f"<div class='g'>정답률 {r['정답률(%)']}%</div></div>"
+            for _, r in weak.iterrows()) + "</div>")
+
+    if s.words:
+        st.markdown("##### 복습 단계별 한자 수")
+        counts = [0] * len(INTERVALS)
+        unseen = 0
+        for w in s.words:
+            e = s.srs.get(w["hanja"])
+            if e is None:
+                unseen += 1
+            else:
+                counts[min(e.get("box", 0), len(INTERVALS) - 1)] += 1
+        bd = pd.DataFrame({"한자 수": [unseen] + counts}, index=["아직 안 풀어봄"] + BOX_LABELS)
+        st.bar_chart(bd, color="#2B3A67", sort=False)
+        st.caption("틀리면 '바로 복습'으로 돌아가고, 맞힐수록 다음 복습까지의 간격이 길어져요.")
+
+    with st.expander("전체 표 보기"):
+        st.dataframe(df, width="stretch", hide_index=True)
 
 
 def render_study():
     s = st.session_state
-    if not s.words:
-        st.info("파일을 업로드하면 단어장이 나와요.")
-        return
-    hide = st.toggle("암기 모드 (뜻·음 가리기)", value=False)
-    df = pd.DataFrame(s.words).rename(columns={"hanja": "한자", "meaning": "뜻", "sound": "음"})
-    if hide:
-        df["뜻"], df["음"] = "???", "?"
-    st.dataframe(df, width="stretch", hide_index=True, height=500)
+    q = st.text_input("검색 (한자·뜻·음)", key="study_q", placeholder="예: 하늘, 천, 天")
+    c1, c2 = st.columns(2)
+    hide = c1.toggle("암기 모드 (뜻·음 가리기, 눌러서 확인)", value=False)
+    view = c2.radio("보기", ["카드", "표"], horizontal=True, label_visibility="collapsed")
+    words = s.words
+    if q.strip():
+        qq = q.strip().lower()
+        words = [w for w in words if qq in (w["hanja"] + w["meaning"] + w["sound"] + w.get("group", "")).lower()]
+    st.caption(f"{len(words)}개")
+    if view == "표":
+        df = pd.DataFrame(words).rename(columns={"hanja": "한자", "meaning": "뜻", "sound": "음", "group": "분류"})
+        if hide and len(df):
+            df["뜻"], df["음"] = "???", "?"
+        st.dataframe(df, width="stretch", hide_index=True, height=480)
+    else:
+        cards = []
+        for w in words:
+            mean = f"<b>{esc(w['meaning'])}</b> {esc(w['sound'])}"
+            body = f"<details><summary>보기</summary>{mean}</details>" if hide else mean
+            g = f"<div class='g'>{esc(w['group'])}</div>" if w.get("group") else ""
+            cards.append(f"<div class='wcard'><div class='h'>{esc(w['hanja'])}</div><div class='m'>{body}</div>{g}</div>")
+        html("<div class='wgrid'>" + "".join(cards) + "</div>")
+    st.divider()
+    render_sheet()
 
 
-# ----------------------------------------------------------------------
-# 사이드바 + 메인
-# ----------------------------------------------------------------------
+# --- 시험지(PDF) ----------------------------------------------------------------
+def _dashed(d, x0, y0, x1, y1, fill, dash=8):
+    if x0 == x1:
+        for t in range(int(y0), int(y1), dash * 2):
+            d.line([(x0, t), (x0, min(t + dash, y1))], fill=fill, width=2)
+    else:
+        for t in range(int(x0), int(x1), dash * 2):
+            d.line([(t, y0), (min(t + dash, x1), y0)], fill=fill, width=2)
+
+
+def make_sheet_pdf(words, kind, font_path, title="한자 시험지"):
+    W, H, M = 1240, 1754, 90  # A4, 150dpi
+    ink, soft, red = (30, 36, 56), (110, 118, 140), (225, 175, 170)
+    f_title, f_num = load_font(font_path, 54), load_font(font_path, 34)
+    f_big, f_txt, f_small = load_font(font_path, 74), load_font(font_path, 44), load_font(font_path, 30)
+    pages = []
+
+    def page(first):
+        im = Image.new("RGB", (W, H), "white")
+        d = ImageDraw.Draw(im)
+        y = M
+        if first:
+            d.text((M, M), title, font=f_title, fill=ink)
+            d.text((W - M, M + 18), f"이름 __________   점수 ____ / {len(words)}", font=f_small, fill=soft, anchor="ra")
+            d.line([(M, M + 90), (W - M, M + 90)], fill=ink, width=3)
+            y = M + 120
+        pages.append(im)
+        return d, y
+
+    if kind == "한자 → 뜻·음 쓰기":
+        row_h = 122
+        d, y0 = page(True)
+        y = y0
+        for i, w in enumerate(words, 1):
+            if y + row_h > H - M:
+                d, y = page(False)
+            d.text((M, y + 60), f"{i}.", font=f_num, fill=soft, anchor="lm")
+            d.text((M + 90, y + 60), w["hanja"], font=f_big, fill=ink, anchor="lm")
+            d.line([(M + 380, y + 100), (W - M, y + 100)], fill=soft, width=2)
+            y += row_h
+    else:
+        row_h, col_w = 160, (W - 2 * M) // 2
+        d, y0 = page(True)
+        y, col = y0, 0
+        for i, w in enumerate(words, 1):
+            if y + row_h > H - M:
+                d, y = page(False)
+                col = 0
+            x = M + col * col_w
+            label = f"{w['meaning']} {w['sound']}".strip()
+            d.text((x, y + 70), f"{i}.", font=f_num, fill=soft, anchor="lm")
+            d.text((x + 62, y + 70), label, font=f_txt, fill=ink, anchor="lm")
+            n = min(len(w["hanja"]), 4)
+            box = min(120, (col_w - 300) // n)
+            bx = x + col_w - 20 - box * n
+            for k in range(n):
+                x0 = bx + k * box
+                d.rectangle([x0, y + 10, x0 + box, y + 10 + box], outline=ink, width=2)
+                _dashed(d, x0 + box // 2, y + 10, x0 + box // 2, y + 10 + box, red)
+                _dashed(d, x0, y + 10 + box // 2, x0 + box, y + 10 + box // 2, red)
+            col += 1
+            if col == 2:
+                col, y = 0, y + row_h
+        # 마지막 줄이 한 칸만 찼다면 아래 정답지가 이어서 시작
+    # 정답지
+    d, y = page(True)
+    d.text((M, M), f"{title} - 정답", font=f_title, fill=ink)
+    y = M + 120
+    d.line([(M, M + 90), (W - M, M + 90)], fill=ink, width=3)
+    line_h, col_w = 62, (W - 2 * M) // 2
+    col = 0
+    for i, w in enumerate(words, 1):
+        if y + line_h > H - M:
+            if col == 0:
+                col, y = 1, M + 120
+            else:
+                d, y = page(False)
+                col, y = 0, M
+        x = M + col * col_w
+        d.text((x, y), f"{i}. {w['hanja']}  {w['meaning']} {w['sound']}", font=f_txt, fill=ink)
+        y += line_h
+    buf = io.BytesIO()
+    pages[0].save(buf, "PDF", save_all=True, append_images=pages[1:], resolution=150)
+    return buf.getvalue()
+
+
+def render_sheet():
+    s = st.session_state
+    with st.expander("🖨️ 시험지 만들기 (PDF)"):
+        font = find_font()
+        if not font:
+            st.info("한자 폰트가 없어 시험지를 만들 수 없어요.")
+            return
+        kind = st.radio("시험 유형", ["한자 → 뜻·음 쓰기", "뜻·음 → 한자 쓰기"], horizontal=True, key="sheet_kind")
+        n = st.slider("문제 수", 5, min(60, max(5, len(s.words))), min(20, max(5, len(s.words))), step=5, key="sheet_n") \
+            if len(s.words) > 5 else len(s.words)
+        if st.button("시험지 만들기", key="make_sheet"):
+            pool = random.sample(s.words, min(n, len(s.words)))
+            with st.spinner("만드는 중..."):
+                s.sheet = make_sheet_pdf(pool, kind, font)
+        if s.sheet:
+            st.download_button("📄 PDF 받기 (마지막 장이 정답지)", s.sheet, "한자시험지.pdf", "application/pdf",
+                               type="primary", width="stretch")
+
+
 def apply_preset():
     name = st.session_state.get("set_preset")
     if name in GRADE_PRESETS:
@@ -1061,117 +1796,90 @@ def grading_sidebar():
             st.button("추천 기록 지우기", on_click=lambda: s.calib.clear())
 
 
-SAMPLE_CSV = "한자,뜻,음\n天,하늘,천\n地,땅,지\n人,사람,인\n山,메,산\n水,물,수\n火,불,화\n日,날,일\n月,달,월\n"
-
-
+# ----------------------------------------------------------------------
+# 사이드바 + 메인
+# ----------------------------------------------------------------------
 def sidebar():
     s = st.session_state
-    st.sidebar.title("📖 한자 퀴즈")
-    f = st.sidebar.file_uploader("한자 파일 업로드 (txt / csv / xlsx)")  # 형식 제한 없음: 태블릿 호환
-    st.sidebar.download_button("샘플 CSV 받기", SAMPLE_CSV.encode("utf-8-sig"), "sample_hanja.csv", "text/csv")
-    if f is not None:
-        sig = (f.name, f.size)
-        if sig != s.file_sig:
-            try:
-                words, dropped = parse_file(f)
-                s.words, s.file_sig = words, sig
-                s.quiz = []
-                s.flash = f"{len(words)}개 한자를 불러왔어요." + (
-                    f" (뜻·음이 없어서 제외한 줄 {dropped}개)" if dropped else ""
-                )
-            except Exception as e:
-                s.flash = f"파일을 읽지 못했어요: {e}"
-    with st.sidebar.expander("✍️ 텍스트 직접 붙여넣기 (파일이 안 될 때)"):
-        pasted = st.text_area("한 줄에 '한자 뜻 음' (예: 天 하늘 천)", height=150, key="paste_text")
-        if st.button("붙여넣은 내용 적용"):
-            words, dropped = build_words(parse_text(pasted))
-            if words:
-                s.words, s.quiz = words, []
-                s.file_sig = (f.name, f.size) if f is not None else None  # 업로드 파일이 덮어쓰지 않게
-                s.flash = f"{len(words)}개 한자를 불러왔어요."
-            else:
-                s.flash = "읽을 수 있는 줄이 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요."
-    st.sidebar.caption(f"불러온 한자: {len(s.words)}개")
-
-    st.sidebar.divider()
-    st.sidebar.radio("문제 유형", ["섞어서", "뜻·음 쓰기", "한자 쓰기"], key="set_type")
-    st.sidebar.radio("문제 범위", ["전체 단어", "오답 노트만"], key="set_source")
-    st.sidebar.number_input("문제 수", 1, 500, 10, key="set_count")
-    st.sidebar.checkbox("순서 섞기", value=True, key="set_shuffle")
+    st.sidebar.title("📖 메뉴")
+    if s.words:
+        with st.sidebar.expander("📂 단어장 바꾸기"):
+            load_panel()
+    st.sidebar.number_input("오늘의 목표 (문제 수)", 5, 500, step=5, key="set_goal")
+    st.sidebar.slider("펜 굵기", 3, 20, key="set_stroke")
     grading_sidebar()
-    st.sidebar.slider("펜 굵기", 3, 20, 8, key="set_stroke")
-    st.sidebar.button("▶️ 시작", type="primary", on_click=start_quiz, width="stretch")
 
-    if not find_font():
-        st.sidebar.warning("한자 폰트를 찾지 못하고 자동으로 내려받지도 못해서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
-    if not HAS_CANVAS:
-        st.sidebar.error(
-            "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못했어요. "
-            "저장소의 requirements.txt(소문자)에 streamlit-drawable-canvas==0.9.3 이 있는지 확인하고 앱을 Reboot 해 주세요."
+    with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
+        st.caption("오답 노트, 통계, 복습 기록, 날짜별 기록이 저장돼요.")
+        payload = json.dumps(
+            {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history}, ensure_ascii=False, indent=2
         )
-        st.sidebar.code(CANVAS_ERR)
-    with st.sidebar.expander("진단 정보"):
+        st.download_button("💾 저장", payload.encode("utf-8"), "hanja_progress.json", "application/json", width="stretch")
+        pf = st.file_uploader("불러오기", type=["json"], key="progress_file")
+        if pf is not None and (pf.name, pf.size) != s.progress_sig:
+            try:
+                data = json.loads(pf.getvalue().decode("utf-8"))
+                s.wrong.update(data.get("wrong", {}))
+                for k, v in data.get("stats", {}).items():
+                    s.stats[k] = v
+                for k, v in data.get("srs", {}).items():
+                    s.srs[k] = v
+                for day, v in data.get("history", {}).items():
+                    cur = s.history.setdefault(day, {"right": 0, "wrong": 0})
+                    cur["right"] = max(cur["right"], v.get("right", 0))
+                    cur["wrong"] = max(cur["wrong"], v.get("wrong", 0))
+                s.progress_sig = (pf.name, pf.size)
+                s.flash = "진행 상황을 불러왔어요."
+            except Exception:
+                s.flash = "진행 파일을 읽지 못했어요."
+
+    with st.sidebar.expander("🧰 진단 정보 / 초기화"):
+        if not find_font():
+            st.warning("한자 폰트를 찾지 못하고 자동으로 내려받지도 못해서 손글씨는 자가 채점으로 진행돼요. (packages.txt에 fonts-noto-cjk가 있는지 확인)")
+        if not HAS_CANVAS:
+            st.error(
+                "⚠️ 한자 쓰기 기능(streamlit-drawable-canvas)을 불러오지 못했어요. "
+                "저장소의 requirements.txt(소문자)에 streamlit-drawable-canvas==0.9.3 이 있는지 확인하고 앱을 Reboot 해 주세요."
+            )
+            st.code(CANVAS_ERR)
         st.write(f"Streamlit 버전: {st.__version__}")
         st.write(f"캔버스 라이브러리: {'정상' if HAS_CANVAS else '불러오기 실패'}")
         st.write(f"한자 폰트: {find_font() or '없음'} ({_FONT['source'] or '-'})")
-
-    st.sidebar.divider()
-    st.sidebar.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
-    st.sidebar.checkbox("전체 초기화 확인 (오답 노트·통계 삭제)", key="confirm_reset")
-    st.sidebar.button(
-        "🗑️ 전체 초기화",
-        on_click=reset_all,
-        disabled=not s.get("confirm_reset", False),
-        width="stretch",
-    )
-
-    st.sidebar.divider()
-    st.sidebar.caption("진행 상황 저장 / 불러오기 (오답 노트 + 통계)")
-    payload = json.dumps({"wrong": s.wrong, "stats": s.stats}, ensure_ascii=False, indent=2)
-    st.sidebar.download_button("💾 저장", payload.encode("utf-8"), "hanja_progress.json", "application/json")
-    pf = st.sidebar.file_uploader("불러오기", type=["json"], key="progress_file")
-    if pf is not None and (pf.name, pf.size) != s.progress_sig:
-        try:
-            data = json.loads(pf.getvalue().decode("utf-8"))
-            s.wrong.update(data.get("wrong", {}))
-            for k, v in data.get("stats", {}).items():
-                s.stats[k] = v
-            s.progress_sig = (pf.name, pf.size)
-            s.flash = "진행 상황을 불러왔어요."
-        except Exception:
-            s.flash = "진행 파일을 읽지 못했어요."
+        st.divider()
+        st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
+        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
+        st.button("🗑️ 전체 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
 
 
 def main():
     init_state()
+    inject_css()
     sidebar()
     s = st.session_state
-    if s.flash:
-        st.info(s.flash)
+    header()
+    if not s.words:
+        if s.flash:
+            st.toast(s.flash)
+            s.flash = ""
+        render_welcome()
+        if s.words:  # 방금 불러왔으면 화면을 새로 그려서 탭을 보여줌
+            st.rerun()
+        return
+    if s.flash:  # 레이아웃을 밀지 않는 토스트로 보여줘야 탭 선택이 풀리지 않아요
+        st.toast(s.flash)
+        s.flash = ""
     if not HAS_CANVAS:
-        st.warning("한자 쓰기 기능을 불러오지 못해 지금은 뜻·음 문제만 풀 수 있어요. 왼쪽 '진단 정보'를 확인해 주세요.")
-    t1, t2, t3, t4 = st.tabs(["✏️ 문제 풀기", "📕 오답 노트", "📊 통계", "📚 단어장"])
+        st.warning("한자 쓰기 기능을 불러오지 못해 지금은 손글씨 문제를 풀 수 없어요. 왼쪽 메뉴의 '진단 정보'를 확인해 주세요.")
+    t1, t2, t3, t4, t5 = st.tabs(["✏️ 연습", "🃏 카드", "📕 오답 노트", "📊 기록", "📚 단어장"])
     with t1:
-        if not s.quiz:
-            st.write("왼쪽에서 파일을 올리고 **시작**을 눌러 주세요.")
-        elif s.pos >= len(s.quiz):
-            render_summary()
-        else:
-            q = s.quiz[s.pos]
-            st.progress(s.pos / len(s.quiz), text=f"{s.pos + 1} / {len(s.quiz)}")
-            done = len(s.results)
-            st.caption(f"현재 점수 {sum(r['correct'] for r in s.results)} / {done}")
-            if s.feedback:
-                render_feedback(q)
-            elif q["type"] == "read":
-                render_read(q["w"])
-            else:
-                render_write(q["w"])
+        render_practice()
     with t2:
-        render_wrong()
+        render_cards()
     with t3:
-        render_stats()
+        render_wrong()
     with t4:
+        render_stats()
+    with t5:
         render_study()
 
 
