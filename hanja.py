@@ -9,18 +9,21 @@ import base64
 import copy
 import glob
 import html as htmllib
+import inspect
 import io
 import json
 import os
 import random
 import re
 import tempfile
+import traceback
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont
 
 CANVAS_ERR = ""
@@ -195,8 +198,14 @@ def parse_file(f):
     return build_words(rows)
 
 
+def _split_raw(s):
+    return [x.strip() for x in re.split(r"[,/;·]", str(s)) if x.strip()]
+
+
 def build_words(rows):
-    words, seen, dropped = [], set(), 0
+    """줄 목록 -> 단어 목록. 같은 한자가 여러 번 나오면(예: 行 행/항) 뜻·음을 합쳐서 모두 정답으로 인정해요.
+    반환: (단어들, 건너뛴 줄 수, 뜻·음을 합친 줄 수)"""
+    words, index, dropped, merged = [], {}, 0, 0
     for row in rows:
         h, m, s_ = row[0], row[1], row[2]
         g = row[3] if len(row) > 3 else ""
@@ -204,11 +213,31 @@ def build_words(rows):
         if not has_hanja(h) or not s_.strip():
             dropped += 1
             continue
-        if h in seen:
+        if h in index:
+            w = words[index[h]]
+            changed = False
+            if m.strip() and m.strip() not in _split_raw(w["meaning"]):
+                w["meaning"] += "/" + m.strip()
+                changed = True
+            if s_.strip() not in _split_raw(w["sound"]):
+                w["sound"] += "/" + s_.strip()
+                changed = True
+            if g.strip() and not w["group"]:
+                w["group"] = str(g).strip()
+            merged += int(changed)
             continue
-        seen.add(h)
+        index[h] = len(words)
         words.append({"hanja": h, "meaning": m.strip(), "sound": s_.strip(), "group": str(g).strip()})
-    return words, dropped
+    return words, dropped, merged
+
+
+def _loaded_msg(n, dropped, merged):
+    msg = f"{n}개 한자를 불러왔어요."
+    if dropped:
+        msg += f" (뜻·음이 없어서 제외한 줄 {dropped}개)"
+    if merged:
+        msg += f" (같은 한자의 다른 뜻·음 {merged}건은 합쳤어요)"
+    return msg
 
 
 # ----------------------------------------------------------------------
@@ -659,8 +688,15 @@ def esc(x):
     return htmllib.escape(str(x))
 
 
+KST = timezone(timedelta(hours=9))  # 서버는 세계 표준시(UTC)라서, 한국 시간으로 '오늘'을 계산해요
+
+
+def today_date():
+    return datetime.now(KST).date()
+
+
 def today_str():
-    return date.today().isoformat()
+    return today_date().isoformat()
 
 
 def init_state():
@@ -668,6 +704,7 @@ def init_state():
         words=[], file_sig=None, quiz=[], pos=0, results=[], feedback=None,
         wrong={}, stats={}, nonce=0, retry_mode=False, hint=False, flash="",
         progress_sig=None, calib=[], set_preset="보통", srs={}, history={}, cards=None, sheet=None,
+        restored=False, store_ok=None,
     )
     defaults.update(GRADE_DEFAULTS)
     defaults.update(SETTING_DEFAULTS)
@@ -684,7 +721,7 @@ def srs_update(key, ok):
     s = st.session_state
     e = s.srs.get(key, {"box": 0, "due": today_str(), "seen": 0})
     box = min(e.get("box", 0) + 1, len(INTERVALS) - 1) if ok else 0
-    due = (date.today() + timedelta(days=INTERVALS[box])).isoformat()
+    due = (today_date() + timedelta(days=INTERVALS[box])).isoformat()
     s.srs[key] = {"box": box, "due": due, "seen": e.get("seen", 0) + 1}
 
 
@@ -849,7 +886,7 @@ def record(w, qtype, ok, ans):
             key, {"hanja": key, "meaning": w["meaning"], "sound": w["sound"], "wrong_count": 0, "last": ""}
         )
         e["wrong_count"] += 1
-        e["last"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        e["last"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
         entry["added_wrong"] = True
     hist_add(day, right=int(ok), wrong=int(not ok))
     srs_update(key, ok)
@@ -907,6 +944,205 @@ def reset_all():
     reset_quiz()
     s.confirm_reset = False
     s.flash = "퀴즈, 오답 노트, 통계, 복습 기록을 모두 초기화했어요."
+
+
+# ----------------------------------------------------------------------
+# 자동 저장 (이 기기의 브라우저에 보관) + 불러온 기록 검증
+# ----------------------------------------------------------------------
+STORE_KEY = "hanja-practice-v1"
+STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0"><script>
+(function () {
+  var KEY = "__KEY__";
+  function send(type, data) {
+    var m = { isStreamlitMessage: true, type: type };
+    for (var k in data) { m[k] = data[k]; }
+    window.parent.postMessage(m, "*");
+  }
+  var loaded = false, last = null;
+  function canStore() {
+    try {
+      window.localStorage.setItem("__hanja_test", "1");
+      window.localStorage.removeItem("__hanja_test");
+      return true;
+    } catch (e) { return false; }
+  }
+  function readStored() {
+    try { return window.localStorage.getItem(KEY) || ""; } catch (e) { return ""; }
+  }
+  window.addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.type !== "streamlit:render") { return; }
+    var a = d.args || {};
+    if (!loaded) {
+      loaded = true;
+      send("streamlit:setComponentValue", {
+        value: JSON.stringify({ ok: canStore(), data: readStored() }), dataType: "json"
+      });
+    }
+    if (typeof a.save === "string" && a.save !== "" && a.save !== last) {
+      try { window.localStorage.setItem(KEY, a.save); last = a.save; } catch (e) {}
+    }
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 0 });
+})();
+</script></body></html>"""
+
+PERSIST_KEYS = [
+    "set_goal", "set_stroke", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
+    "card_src", "card_dir", "card_shuffle", "card_count",
+] + list(GRADE_DEFAULTS)
+ALLOWED = {
+    "set_type": ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"],
+    "set_source": ["전체 단어", "오늘 복습할 것", "오답 노트만"],
+    "card_src": ["전체 단어", "오늘 복습할 것", "오답 노트만"],
+    "card_dir": ["한자 → 뜻·음", "뜻·음 → 한자"],
+    "set_preset": ["관대", "보통", "엄격", "직접 설정"],
+}
+
+
+def _int(x, default=0, lo=0, hi=10**9):
+    try:
+        return max(lo, min(hi, int(x)))
+    except Exception:
+        return default
+
+
+def _iso(x):
+    try:
+        return date.fromisoformat(str(x)).isoformat()
+    except Exception:
+        return None
+
+
+def _clean_word(w):
+    if not isinstance(w, dict):
+        return None
+    h, sd = str(w.get("hanja", "")).strip(), str(w.get("sound", "")).strip()
+    if not has_hanja(h) or not sd:
+        return None
+    return {"hanja": h, "meaning": str(w.get("meaning", "")).strip(), "sound": sd,
+            "group": str(w.get("group", "")).strip()}
+
+
+def sanitize_progress(d):
+    """파일/브라우저에서 읽은 기록을 검사해서, 엉뚱한 값이 섞여 있어도 앱이 깨지지 않게 걸러 줘요"""
+    out = {"wrong": {}, "stats": {}, "srs": {}, "history": {}}
+    if not isinstance(d, dict):
+        return out
+    for k, v in (d.get("wrong") or {}).items():
+        if isinstance(v, dict) and has_hanja(str(k)):
+            out["wrong"][str(k)] = {
+                "hanja": str(k), "meaning": str(v.get("meaning", "")), "sound": str(v.get("sound", "")),
+                "wrong_count": _int(v.get("wrong_count"), 1, 1), "last": str(v.get("last", "")),
+            }
+    for k, v in (d.get("stats") or {}).items():
+        if isinstance(v, dict) and has_hanja(str(k)):
+            out["stats"][str(k)] = {
+                "meaning": str(v.get("meaning", "")), "sound": str(v.get("sound", "")),
+                "right": _int(v.get("right")), "wrong": _int(v.get("wrong")),
+            }
+    for k, v in (d.get("srs") or {}).items():
+        due = _iso(v.get("due")) if isinstance(v, dict) else None
+        if due and has_hanja(str(k)):
+            out["srs"][str(k)] = {"box": _int(v.get("box"), 0, 0, len(INTERVALS) - 1), "due": due,
+                                  "seen": _int(v.get("seen"))}
+    for day, v in (d.get("history") or {}).items():
+        if isinstance(v, dict) and _iso(day):
+            out["history"][_iso(day)] = {"right": _int(v.get("right")), "wrong": _int(v.get("wrong"))}
+    return out
+
+
+def merge_progress(clean):
+    s = st.session_state
+    s.wrong.update(clean["wrong"])
+    s.stats.update(clean["stats"])
+    s.srs.update(clean["srs"])
+    for day, v in clean["history"].items():
+        cur = s.history.setdefault(day, {"right": 0, "wrong": 0})
+        cur["right"] = max(cur["right"], v["right"])
+        cur["wrong"] = max(cur["wrong"], v["wrong"])
+
+
+def build_payload():
+    s = st.session_state
+    data = {"v": 1, "words": s.words, "wrong": s.wrong, "stats": s.stats, "srs": s.srs,
+            "history": s.history, "settings": {k: s[k] for k in PERSIST_KEYS if k in s}}
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def apply_payload(raw):
+    """브라우저에 저장돼 있던 단어장·기록·설정을 되살려요. 성공하면 True"""
+    s = st.session_state
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if not s.words:
+        seen, words = set(), []
+        for w in data.get("words") or []:
+            c = _clean_word(w)
+            if c and c["hanja"] not in seen:
+                seen.add(c["hanja"])
+                words.append(c)
+        s.words = words
+    merge_progress(sanitize_progress(data))
+    defaults = dict(GRADE_DEFAULTS)
+    defaults.update(SETTING_DEFAULTS)
+    defaults["set_preset"] = "보통"
+    for k, v in (data.get("settings") or {}).items():
+        if k in PERSIST_KEYS and k in defaults and type(v) is type(defaults[k]):
+            if k in ALLOWED and v not in ALLOWED[k]:
+                continue
+            s[k] = v
+    return bool(s.words or s.wrong or s.stats or s.srs or s.history)
+
+
+@st.cache_resource(show_spinner=False)
+def _store_component():
+    d = os.path.join(tempfile.gettempdir(), "hanja_browser_store")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(STORE_HTML.replace("__KEY__", STORE_KEY))
+    return components.declare_component("hanja_browser_store", path=d)
+
+
+def sync_browser_store():
+    """매 실행마다 현재 상태를 브라우저에 저장하고, 새로 열었을 땐 저장돼 있던 기록을 되살려요.
+    실패해도 앱은 평소처럼 동작해요(저장만 안 될 뿐)."""
+    s = st.session_state
+    save = ""
+    if s.restored and (s.words or s.wrong or s.stats or s.srs or s.history):
+        save = build_payload()  # 불러오기 전에는 저장하지 않아서, 빈 상태가 기존 기록을 덮어쓰지 않아요
+    try:
+        with st.container(key="store_box"):
+            got = _store_component()(save=save, key="browser_store", default=None)
+    except Exception:
+        s.restored, s.store_ok = True, False
+        return
+    if got is None or s.restored:
+        return
+    s.restored = True
+    try:
+        info = json.loads(got) if isinstance(got, str) else dict(got)
+    except Exception:
+        info = {}
+    s.store_ok = bool(info.get("ok"))
+    raw = info.get("data", "")
+    if raw and apply_payload(raw):
+        s.flash = f"이전 학습 기록을 불러왔어요. (한자 {len(s.words)}개)" if s.words else "이전 학습 기록을 불러왔어요."
+
+
+def repair_state():
+    """화면이 꼬였을 때: 진행 중이던 퀴즈·카드만 비워요 (단어장·기록은 그대로)"""
+    s = st.session_state
+    s.quiz, s.pos, s.results, s.feedback, s.cards, s.sheet = [], 0, [], None, None, None
+    s.hint = False
+    s.nonce += 1
+    s.flash = "화면을 정리했어요."
+
 
 
 # --- 플래시카드 ---------------------------------------------------------------
@@ -977,8 +1213,8 @@ CSS = """
 .app-head{display:flex; align-items:center; gap:14px; margin:0 0 .6rem;}
 .app-head .seal{width:52px; height:52px; border-radius:10px; background:var(--seal); color:#fff;
   display:grid; place-items:center; font:700 31px/1 var(--serif); transform:rotate(-3deg); flex:none;}
-.app-head .title{font:700 1.9rem/1.15 var(--serif); color:var(--ink);}
-.app-head .sub{color:var(--soft); font-size:.95rem; margin-top:2px;}
+.app-head .title{font:700 1.9rem/1.15 var(--serif); color:inherit;}
+.app-head .sub{color:inherit; opacity:.7; font-size:.95rem; margin-top:2px;}
 .chips{display:flex; flex-wrap:wrap; gap:8px; margin:.2rem 0 .7rem;}
 .chip{display:inline-flex; align-items:center; gap:6px; padding:.3rem .85rem; border-radius:999px;
   background:var(--mist); color:var(--ink); font-weight:500; font-size:.95rem;}
@@ -1010,7 +1246,7 @@ CSS = """
 .mean-card{max-width:520px; margin:.3rem auto .8rem; padding:1.1rem 1rem; text-align:center; background:#fff;
   border:2px solid var(--indigo); border-radius:6px; font-family:var(--serif); font-size:2rem; line-height:1.35; color:var(--ink);}
 .mean-card b{display:block; font-size:2.3rem; margin-top:.15rem; color:var(--indigo);}
-.ask{text-align:center; color:var(--soft); margin:.1rem 0 .9rem; font-size:1.05rem;}
+.ask{text-align:center; color:inherit; opacity:.75; margin:.1rem 0 .9rem; font-size:1.05rem;}
 
 /* 결과: 도장 */
 .fb-row{display:flex; align-items:center; justify-content:center; gap:1.4rem; flex-wrap:wrap; margin:.6rem 0 1rem;}
@@ -1043,6 +1279,20 @@ CSS = """
 .score-box{text-align:center; padding:1.2rem; border:2px solid var(--indigo); border-radius:6px; background:#fff; margin-bottom:1rem;}
 .score-box .big{font:700 3.2rem/1.1 var(--serif); color:var(--indigo);}
 .score-box .lbl{color:var(--soft);}
+
+/* 어두운 화면 설정(다크 모드)에서도 글씨가 보이게: 흰 배경 위의 글씨는 색을 직접 지정 */
+.stRadio [role="radiogroup"] label, .stRadio [role="radiogroup"] label p{color:var(--ink);}
+.st-key-choices_ko button, .st-key-choices_hj button, .st-key-choices_ko button p, .st-key-choices_hj button p{color:var(--ink);}
+
+/* 자동 저장용 보이지 않는 조각 */
+.st-key-store_box{height:0; margin:0 0 -1rem; padding:0; overflow:hidden;}
+
+/* 시작 화면 3단계 */
+.steps{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:.4rem 0 1rem;}
+.step{display:flex; flex-direction:column; align-items:center; gap:.4rem; text-align:center; padding:.8rem .4rem;
+  background:#fff; border:1px solid var(--line); border-radius:10px; color:var(--ink); font-size:.92rem; line-height:1.35;}
+.step b{display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:var(--indigo);
+  color:#fff; font:700 1rem/1 var(--serif);}
 </style>
 """
 
@@ -1117,6 +1367,10 @@ def header():
         chips.append(f"<span class='chip'>🌱 아직 안 푼 {new}개</span>")
     if s.wrong:
         chips.append(f"<span class='chip'>📕 오답 노트 {len(s.wrong)}개</span>")
+    if s.store_ok:
+        chips.append("<span class='chip good'>💾 자동 저장 켜짐</span>")
+    elif s.store_ok is False and s.restored:
+        chips.append("<span class='chip hot'>⚠️ 이 브라우저에선 자동 저장이 안 돼요</span>")
     html("<div class='chips'>" + "".join(chips) + "</div>")
     st.progress(min(1.0, done / goal), text=f"오늘의 목표 {done} / {goal}문제" + (" 🎉 달성!" if done >= goal else ""))
 
@@ -1140,40 +1394,69 @@ def load_panel():
         sig = (f.name, f.size)
         if sig != s.file_sig:
             try:
-                words, dropped = parse_file(f)
-                s.words, s.file_sig = words, sig
-                s.quiz, s.cards = [], None
-                s.flash = f"{len(words)}개 한자를 불러왔어요." + (
-                    f" (뜻·음이 없어서 제외한 줄 {dropped}개)" if dropped else ""
-                )
+                words, dropped, merged = parse_file(f)
+                s.file_sig = sig
+                if words:
+                    s.words = words
+                    s.quiz, s.cards = [], None
+                    s.flash = _loaded_msg(len(words), dropped, merged)
+                else:
+                    s.flash = "읽을 수 있는 한자가 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요."
             except Exception as e:
                 s.flash = f"파일을 읽지 못했어요: {e}"
     with st.expander("✍️ 텍스트 직접 붙여넣기 (파일이 안 될 때)"):
         pasted = st.text_area("한 줄에 '한자 뜻 음' (예: 天 하늘 천)", height=150, key="paste_text")
         if st.button("붙여넣은 내용 적용"):
-            words, dropped = build_words(parse_text(pasted))
+            words, dropped, merged = build_words(parse_text(pasted))
             if words:
                 s.words, s.quiz, s.cards = words, [], None
                 s.file_sig = (f.name, f.size) if f is not None else None  # 업로드 파일이 덮어쓰지 않게
-                s.flash = f"{len(words)}개 한자를 불러왔어요."
+                s.flash = _loaded_msg(len(words), dropped, merged)
             else:
                 s.flash = "읽을 수 있는 줄이 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요."
 
 
+def load_sample():
+    s = st.session_state
+    df = pd.read_csv(io.StringIO(SAMPLE_CSV), header=None, dtype=str, keep_default_na=False)
+    words, _, _ = build_words(parse_table(df))
+    s.words, s.quiz, s.cards = words, [], None
+    f = s.get("wordfile")
+    s.file_sig = (f.name, f.size) if f is not None else None  # 이미 올려 둔 파일이 샘플을 덮어쓰지 않게
+    s.flash = f"샘플 한자 {len(words)}개를 불러왔어요. 마음껏 둘러보세요!"
+
+
 def render_welcome():
     st.subheader("단어장을 불러와 볼까요?")
-    st.write("한자·뜻·음이 적힌 파일을 올리면 문제, 카드, 시험지가 자동으로 만들어져요.")
+    html(
+        "<div class='steps'>"
+        "<div class='step'><b>1</b><span>한자·뜻·음이 적힌<br>파일을 올려요</span></div>"
+        "<div class='step'><b>2</b><span>문제 · 카드로<br>연습해요</span></div>"
+        "<div class='step'><b>3</b><span>매일 조금씩<br>복습해요</span></div>"
+        "</div>"
+    )
+    st.button("✨ 샘플로 먼저 둘러보기", on_click=load_sample, width="stretch",
+              help="파일이 없어도 샘플 한자 22개로 바로 체험해 볼 수 있어요.")
     load_panel()
-    st.caption("파일이 없다면 위의 '샘플 CSV 받기'로 받은 뒤 다시 올려서 먼저 둘러볼 수 있어요.")
+    st.caption("💾 푼 기록과 단어장은 이 기기의 브라우저에 자동으로 저장돼서, 다시 들어오면 이어서 할 수 있어요. "
+               "(다른 기기와는 따로 저장돼요)")
 
 
 # ----------------------------------------------------------------------
 # 화면: 연습 (설정 → 문제 → 결과)
 # ----------------------------------------------------------------------
+def quick_start():
+    """복습할 차례인 한자부터 바로 시작"""
+    st.session_state.set_source = "오늘 복습할 것"
+    start_quiz()
+
+
 def render_home():
     s = st.session_state
     st.subheader("오늘은 무엇을 연습할까요?")
     new, review = due_counts(s.words)
+    if review + new:
+        st.button(f"⚡ 오늘 복습 바로 시작 (복습 {review} · 새 한자 {new})", on_click=quick_start, width="stretch")
     st.radio("문제 유형", ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"], key="set_type", horizontal=True,
              help="뜻·음 쓰기: 키보드로 입력 / 한자 쓰기: 손글씨 / 객관식: 4개 중 고르기")
     st.radio("문제 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="set_source", horizontal=True,
@@ -1306,17 +1589,23 @@ def canvas_backdrop(img):
 
 def draw_canvas(key):
     s = st.session_state
+    kwargs = dict(
+        fill_color="rgba(255,255,255,0)",
+        stroke_width=int(s.get("set_stroke", 8)),
+        stroke_color="#000000",
+        background_color="",
+        height=CANVAS_PX,
+        width=CANVAS_PX,
+        drawing_mode="freedraw",
+        key=key,
+    )
+    try:  # 새 버전 캔버스 라이브러리는 이 옵션을 켜야 글씨 이미지를 돌려줘요 (옛 버전엔 없는 옵션)
+        if "return_image_data" in inspect.signature(st_canvas).parameters:
+            kwargs["return_image_data"] = True
+    except Exception:
+        pass
     try:
-        return st_canvas(
-            fill_color="rgba(255,255,255,0)",
-            stroke_width=int(s.get("set_stroke", 8)),
-            stroke_color="#000000",
-            background_color="",
-            height=CANVAS_PX,
-            width=CANVAS_PX,
-            drawing_mode="freedraw",
-            key=key,
-        )
+        return st_canvas(**kwargs)
     except Exception as e:
         st.error(f"캔버스를 표시하지 못했어요: {type(e).__name__}: {e}")
         return None
@@ -1570,7 +1859,7 @@ def render_stats():
 
     if s.history:
         st.markdown("##### 최근 14일")
-        days = [(date.today() - timedelta(days=d)).isoformat() for d in range(13, -1, -1)]
+        days = [(today_date() - timedelta(days=d)).isoformat() for d in range(13, -1, -1)]
         hd = pd.DataFrame(
             {"맞음": [s.history.get(d, {}).get("right", 0) for d in days],
              "틀림": [s.history.get(d, {}).get("wrong", 0) for d in days]},
@@ -1810,7 +2099,7 @@ def sidebar():
     grading_sidebar()
 
     with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
-        st.caption("오답 노트, 통계, 복습 기록, 날짜별 기록이 저장돼요.")
+        st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록)")
         payload = json.dumps(
             {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history}, ensure_ascii=False, indent=2
         )
@@ -1819,15 +2108,7 @@ def sidebar():
         if pf is not None and (pf.name, pf.size) != s.progress_sig:
             try:
                 data = json.loads(pf.getvalue().decode("utf-8"))
-                s.wrong.update(data.get("wrong", {}))
-                for k, v in data.get("stats", {}).items():
-                    s.stats[k] = v
-                for k, v in data.get("srs", {}).items():
-                    s.srs[k] = v
-                for day, v in data.get("history", {}).items():
-                    cur = s.history.setdefault(day, {"right": 0, "wrong": 0})
-                    cur["right"] = max(cur["right"], v.get("right", 0))
-                    cur["wrong"] = max(cur["wrong"], v.get("wrong", 0))
+                merge_progress(sanitize_progress(data))
                 s.progress_sig = (pf.name, pf.size)
                 s.flash = "진행 상황을 불러왔어요."
             except Exception:
@@ -1845,15 +2126,14 @@ def sidebar():
         st.write(f"Streamlit 버전: {st.__version__}")
         st.write(f"캔버스 라이브러리: {'정상' if HAS_CANVAS else '불러오기 실패'}")
         st.write(f"한자 폰트: {find_font() or '없음'} ({_FONT['source'] or '-'})")
+        st.write("자동 저장: " + {True: "켜짐", False: "이 브라우저에서는 사용할 수 없음", None: "확인 중"}[s.store_ok])
         st.divider()
         st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
         st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
         st.button("🗑️ 전체 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
 
 
-def main():
-    init_state()
-    inject_css()
+def run_app():
     sidebar()
     s = st.session_state
     header()
@@ -1881,6 +2161,19 @@ def main():
         render_stats()
     with t5:
         render_study()
+
+
+def main():
+    init_state()
+    inject_css()  # 먼저 깔아서, 저장용 보이지 않는 조각이 잠깐이라도 보이지 않게
+    sync_browser_store()
+    try:
+        run_app()
+    except Exception:  # 예상 못 한 오류가 나도 하얀 화면 대신 복구 버튼을 보여줘요
+        st.error("앗, 화면을 그리다가 문제가 생겼어요. 아래 버튼으로 정리하면 대부분 해결돼요. (단어장과 기록은 그대로예요)")
+        st.button("🔄 화면 정리하고 다시 시작", on_click=repair_state, type="primary")
+        with st.expander("자세한 오류 내용 (문제가 계속되면 이걸 알려 주세요)"):
+            st.code(traceback.format_exc())
 
 
 main()
