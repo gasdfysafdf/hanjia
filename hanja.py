@@ -144,10 +144,24 @@ def decode_bytes(data):
     raise ValueError("파일 인코딩을 읽을 수 없어요. UTF-8로 저장해 주세요.")
 
 
+_DELIM = re.compile(r"[,\t;|]")
+
+
 def parse_text(text):
+    """줄마다 '한자 뜻 음' (공백 구분) 또는 '한자,뜻,음,분류' (쉼표·탭 구분, 4번째 열은 분류)"""
+    lines = [ln.strip().lstrip("\ufeff") for ln in text.splitlines() if ln.strip()]
     rows = []
-    for line in text.splitlines():
-        toks = [t for t in re.split(r"[,\t;|\s]+", line.strip()) if t]
+    if lines and sum(1 for ln in lines if _DELIM.search(ln)) * 2 >= len(lines):
+        cells = [[c.strip() for c in _DELIM.split(ln)] for ln in lines]
+        width = max(len(c) for c in cells)
+        for r in parse_table(pd.DataFrame([c + [""] * (width - len(c)) for c in cells])):
+            h, m, s_ = r[0], r[1], r[2]
+            if not s_.strip() and " " in m.strip():  # '天, 하늘 천' 처럼 뜻·음이 한 칸에 있는 경우
+                m, s_ = m.strip().rsplit(None, 1)
+            rows.append((h, m, s_) + tuple(r[3:]))
+        return rows
+    for ln in lines:
+        toks = [t for t in re.split(r"[,\t;|\s]+", ln) if t]
         if len(toks) >= 3 and has_hanja(toks[0]):
             rows.append((toks[0], " ".join(toks[1:-1]), toks[-1]))
     return rows
@@ -160,7 +174,10 @@ def parse_table(df):
     first = [x.strip().lower() for x in df.iloc[0]]
     cols = {"hanja": 0, "meaning": 1, "sound": 2, "group": None}
     start = 0
+    if df.shape[1] >= 4:  # 헤더가 없어도 4번째 열은 급수/단원/분류로 봄 (안내 문구와 같게)
+        cols["group"] = 3
     if not any(has_hanja(x) for x in first):  # 첫 줄이 헤더
+        cols["group"] = None
         start = 1
         for key, names in ALIASES.items():
             for i, h in enumerate(first):
@@ -433,6 +450,9 @@ def prep_shape(mask):
     return {"pts": pts, "thick": _thick_mask(sub), "dt": _dist_map(pts)}
 
 
+TPL_CACHE_MAX = 500  # 서버 메모리 보호용: 보관하는 정답 글자 분석 결과 수
+
+
 def get_templates(ch, font_path, use_variants=True):
     """정답 글자의 골격(글꼴 변형별). 한 번 계산하면 캐시에 보관"""
     key = ("tpl", font_path, ch, bool(use_variants))
@@ -453,6 +473,10 @@ def get_templates(ch, font_path, use_variants=True):
         if shp is not None:
             out.append(shp)
     store[key] = out
+    tpl_keys = [k for k in list(store) if k[0] == "tpl"]
+    if len(tpl_keys) > TPL_CACHE_MAX:  # 오래된 절반을 비움 (다시 필요하면 자동으로 다시 계산)
+        for k in tpl_keys[: len(tpl_keys) // 2]:
+            store.pop(k, None)
     return out
 
 
@@ -754,6 +778,23 @@ def hist_add(day, right=0, wrong=0):
     h = st.session_state.history.setdefault(day, {"right": 0, "wrong": 0})
     h["right"] += right
     h["wrong"] += wrong
+
+
+def study_streak():
+    """오늘(아직 안 풀었으면 어제)부터 거꾸로, 하루도 안 빠지고 푼 날이 며칠인지"""
+    h = st.session_state.history
+
+    def done(d):
+        v = h.get(d.isoformat(), {})
+        return v.get("right", 0) + v.get("wrong", 0) > 0
+
+    d, n = today_date(), 0
+    if not done(d):
+        d -= timedelta(days=1)
+    while done(d) and n < 3650:
+        n += 1
+        d -= timedelta(days=1)
+    return n
 
 
 def hist_today():
@@ -1064,6 +1105,13 @@ def merge_progress(clean):
         cur["wrong"] = max(cur["wrong"], v["wrong"])
 
 
+def progress_json():
+    s = st.session_state
+    return json.dumps(
+        {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history}, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+
 def build_payload():
     s = st.session_state
     data = {"v": 1, "words": s.words, "wrong": s.wrong, "stats": s.stats, "srs": s.srs,
@@ -1361,6 +1409,9 @@ def header():
     goal = max(1, int(s.get("set_goal", 20)))
     done = hist_today()
     chips = [f"<span class='chip'>📚 한자 {len(s.words)}개</span>"]
+    days = study_streak()
+    if days >= 2:
+        chips.append(f"<span class='chip good'>🔥 {days}일 연속 학습</span>")
     if review:
         chips.append(f"<span class='chip hot'>🔁 복습할 차례 {review}개</span>")
     if new:
@@ -1461,7 +1512,8 @@ def render_home():
              help="뜻·음 쓰기: 키보드로 입력 / 한자 쓰기: 손글씨 / 객관식: 4개 중 고르기")
     st.radio("문제 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="set_source", horizontal=True,
              help=f"'오늘 복습할 것'은 복습 날짜가 된 한자({review}개)와 아직 안 푼 한자({new}개)를 약한 것부터 골라줘요.")
-    groups = sorted({w["group"] for w in s.words if w.get("group")})
+    groups = sorted({w["group"] for w in s.words if w.get("group")},
+                    key=lambda g: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", g)])
     if groups:
         s.set_groups = [g for g in s.set_groups if g in groups]
         st.multiselect("급수/단원/분류 (비워 두면 전체)", groups, key="set_groups", placeholder="전체 (눌러서 고르기)")
@@ -1892,6 +1944,11 @@ def render_stats():
 
     with st.expander("전체 표 보기"):
         st.dataframe(df, width="stretch", hide_index=True)
+    with st.expander("💾 기록 백업 (브라우저 데이터가 지워질 때를 대비)"):
+        st.caption("기록은 이 브라우저에 자동 저장돼요. 다만 아이폰 사파리처럼 한동안 안 들어오면 저장 공간을 비우는 "
+                   "브라우저도 있어서, 가끔 백업 파일을 받아 두면 안전해요. 복구는 왼쪽 메뉴 '진행 상황 저장 / 불러오기'에서 해요.")
+        st.download_button("💾 백업 파일 받기", progress_json(), "hanja_progress.json", "application/json",
+                           width="stretch", key="backup_stats")
 
 
 def render_study():
@@ -1987,7 +2044,7 @@ def make_sheet_pdf(words, kind, font_path, title="한자 시험지"):
                 col, y = 0, y + row_h
         # 마지막 줄이 한 칸만 찼다면 아래 정답지가 이어서 시작
     # 정답지
-    d, y = page(True)
+    d, y = page(False)
     d.text((M, M), f"{title} - 정답", font=f_title, fill=ink)
     y = M + 120
     d.line([(M, M + 90), (W - M, M + 90)], fill=ink, width=3)
@@ -2100,10 +2157,8 @@ def sidebar():
 
     with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
         st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록)")
-        payload = json.dumps(
-            {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history}, ensure_ascii=False, indent=2
-        )
-        st.download_button("💾 저장", payload.encode("utf-8"), "hanja_progress.json", "application/json", width="stretch")
+        st.download_button("💾 저장", progress_json(), "hanja_progress.json", "application/json", width="stretch",
+                           key="backup_side")
         pf = st.file_uploader("불러오기", type=["json"], key="progress_file")
         if pf is not None and (pf.name, pf.size) != s.progress_sig:
             try:
