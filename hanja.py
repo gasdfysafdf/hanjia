@@ -16,6 +16,7 @@ import os
 import random
 import re
 import tempfile
+import time
 import traceback
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -64,8 +65,20 @@ def load_font(path, size):
     return ImageFont.truetype(path, size)
 
 
-FONT_URL = "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/KR/NotoSansKR-Regular.otf"
-_FONT = {"path": None, "source": ""}
+FONT_URLS = [
+    "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/KR/NotoSansKR-Regular.otf",
+    "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/SubsetOTF/KR/NotoSansKR-Regular.otf",  # 예비 주소
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _font_state():
+    """폰트 위치와 '내려받기 실패 시각'을 화면이 다시 그려져도 기억해요 (실행마다 새로 초기화되지 않게)"""
+    return {"path": None, "source": "", "fail_at": 0.0}
+
+
+_FONT = _font_state()
+FONT_RETRY_SEC = 120  # 내려받기에 실패하면 이 시간 동안은 다시 시도하지 않아요
 
 
 def _system_font():
@@ -92,28 +105,39 @@ def _download_font():
     """시스템에 한자 폰트가 없을 때 Noto Sans KR(약 4.6MB)을 한 번 내려받아 사용"""
     path = os.path.join(tempfile.gettempdir(), "hanja_font", "NotoSansKR-Regular.otf")
     try:
-        if not (os.path.exists(path) and os.path.getsize(path) > 1_000_000):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with urllib.request.urlopen(FONT_URL, timeout=60) as r, open(path + ".part", "wb") as f:
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            load_font(path, 40)
+            return path
+    except Exception:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for url in FONT_URLS:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r, open(path + ".part", "wb") as f:
                 f.write(r.read())
             os.replace(path + ".part", path)
-        load_font(path, 40)
-        return path
-    except Exception:
-        return None
+            load_font(path, 40)
+            return path
+        except Exception:
+            continue
+    return None
 
 
 def find_font():
-    """성공한 결과만 저장해서, 실패하면 다음 실행 때 다시 시도"""
-    if _FONT["path"]:
+    """폰트를 찾아요. 못 찾으면 한동안 다시 시도하지 않아서, 화면이 다시 그려질 때마다 멈추지 않아요"""
+    if _FONT["path"] and os.path.exists(_FONT["path"]):
         return _FONT["path"]
     p = _system_font()
     if p:
         _FONT.update(path=p, source="서버에 설치된 폰트")
         return p
+    if time.time() - _FONT["fail_at"] < FONT_RETRY_SEC:
+        return None
     p = _download_font()
     if p:
         _FONT.update(path=p, source="자동 내려받음")
+    else:
+        _FONT["fail_at"] = time.time()
     return p
 
 
@@ -702,7 +726,7 @@ TYPE_LABELS = {
 }
 SETTING_DEFAULTS = dict(
     set_type="섞어서", set_source="전체 단어", set_count=10, set_shuffle=True, set_groups=[],
-    set_goal=20, set_stroke=8,
+    set_goal=20, set_stroke=8, set_canvas=280,
     card_src="전체 단어", card_dir="한자 → 뜻·음", card_shuffle=True, card_count=20,
 )
 KEEP_KEYS = list(SETTING_DEFAULTS)  # 화면에 없는 동안에도 값이 사라지지 않게 붙잡아 둘 설정들
@@ -1030,7 +1054,7 @@ STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body st
 </script></body></html>"""
 
 PERSIST_KEYS = [
-    "set_goal", "set_stroke", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
+    "set_goal", "set_stroke", "set_canvas", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
     "card_src", "card_dir", "card_shuffle", "card_count",
 ] + list(GRADE_DEFAULTS)
 ALLOWED = {
@@ -1144,6 +1168,8 @@ def apply_payload(raw):
         if k in PERSIST_KEYS and k in defaults and type(v) is type(defaults[k]):
             if k in ALLOWED and v not in ALLOWED[k]:
                 continue
+            if k == "set_canvas":  # 엉뚱한 값이 저장돼 있어도 슬라이더가 깨지지 않게 범위 안으로
+                v = _int(v, 280, 200, 400)
             s[k] = v
     return bool(s.words or s.wrong or s.stats or s.srs or s.history)
 
@@ -1322,6 +1348,7 @@ CSS = """
 .wcard details summary{cursor:pointer; color:var(--indigo); font-size:.9rem; list-style:none; padding:.25rem 0;}
 .wcard details summary::-webkit-details-marker{display:none;}
 .wcard .g{font-size:.75rem; color:var(--soft);}
+.wcard mark{background:#FFE9A8; color:inherit; border-radius:3px; padding:0 2px;}
 
 /* 결과 요약 */
 .score-box{text-align:center; padding:1.2rem; border:2px solid var(--indigo); border-radius:6px; background:#fff; margin-bottom:1rem;}
@@ -1616,7 +1643,9 @@ def answer_choice(w, ty, o):
 
 
 # --- 한자 쓰기 ----------------------------------------------------------------
-CANVAS_PX = 360
+def canvas_px():
+    """한자를 쓰는 칸의 한 변 길이(px). 사이드바의 '쓰는 칸 크기'에서 바꿀 수 있어요"""
+    return _int(st.session_state.get("set_canvas"), 280, 200, 400)
 
 
 def flatten(data):
@@ -1627,27 +1656,27 @@ def flatten(data):
     return out.astype(np.uint8)
 
 
-def canvas_backdrop(img):
+def canvas_backdrop(img, px):
     """캔버스 뒤쪽 칸(iframe)에 십자 점선·힌트 글씨를 CSS 배경으로 깔아요. 캔버스 자체는 투명해서 채점에는 영향이 없어요"""
     buf = io.BytesIO()
     img.save(buf, "PNG")
     uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
     html(
-        "<style>.st-key-canvas_box{width:412px; max-width:100%; background:url(" + uri + ") 0 0 / "
-        f"{CANVAS_PX}px {CANVAS_PX}px no-repeat;}}"
+        f"<style>.st-key-canvas_box{{width:{px + 52}px; max-width:100%; background:url(" + uri + ") 0 0 / "
+        f"{px}px {px}px no-repeat;}}"
         ".st-key-canvas_box iframe{mix-blend-mode:multiply;}</style>"
     )
 
 
-def draw_canvas(key):
+def draw_canvas(key, px):
     s = st.session_state
     kwargs = dict(
         fill_color="rgba(255,255,255,0)",
         stroke_width=int(s.get("set_stroke", 8)),
         stroke_color="#000000",
         background_color="",
-        height=CANVAS_PX,
-        width=CANVAS_PX,
+        height=px,
+        width=px,
         drawing_mode="freedraw",
         key=key,
     )
@@ -1666,16 +1695,19 @@ def draw_canvas(key):
 def render_write(w):
     s = st.session_state
     font = find_font()
+    px = canvas_px()
     left, right = st.columns([1, 1])
     with left:
         meaning_card(w)
         html("<div class='ask'>에 해당하는 한자를 오른쪽 칸에 쓰세요</div>")
         hint = st.checkbox("연한 글씨 가이드 보기 (힌트)", key=f"hint_{s.pos}_{s.nonce}", disabled=font is None)
+        if font is None:  # 체크박스가 회색으로 막혀 있는 이유를 알려줘요
+            st.caption("⚠️ 서버에서 한자 폰트를 불러오지 못해 힌트를 쓸 수 없어요. 제출하면 정답과 비교해서 직접 채점해요.")
     # 십자 점선은 항상 깔고, 힌트를 켜면 정답 글자가 연한 회색으로 같이 나와요
-    canvas_backdrop(guide_image(w["hanja"], font, CANVAS_PX) if (hint and font) else grid_image(CANVAS_PX))
+    canvas_backdrop(guide_image(w["hanja"], font, px) if (hint and font) else grid_image(px), px)
     with right:
         with st.container(key="canvas_box"):
-            res = draw_canvas(f"cv_{s.pos}_{s.nonce}_{int(hint)}")
+            res = draw_canvas(f"cv_{s.pos}_{s.nonce}_{int(hint)}_{px}", px)
     b1, b2, b3 = st.columns(3)
     if b1.button("제출", type="primary", width="stretch"):
         data = flatten(res.image_data) if (res is not None and res.image_data is not None) else None
@@ -1951,17 +1983,51 @@ def render_stats():
                            width="stretch", key="backup_stats")
 
 
+def _terms(q):
+    return [t for t in re.split(r"\s+", str(q).strip().lower()) if t]
+
+
+def word_matches(w, terms):
+    """검색어(띄어쓰기로 여러 개 가능)가 모두 한자·뜻·음·분류 중 어딘가에 들어 있으면 통과.
+    필드를 이어 붙이지 않고 따로 비교해서, '하늘'+'천' 사이에 걸친 '늘천' 같은 엉뚱한 결과가 안 나와요"""
+    fields = [w["hanja"].lower(), w["meaning"].lower(), w["sound"].lower(), w.get("group", "").lower()]
+    return all(any(t in f for f in fields) for t in terms)
+
+
+def highlight(text, terms):
+    """검색어와 겹치는 부분에 형광펜 (HTML 안전)"""
+    text = str(text)
+    if not terms:
+        return esc(text)
+    pat = re.compile("(" + "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)) + ")", re.I)
+    return "".join(f"<mark>{esc(p)}</mark>" if i % 2 else esc(p) for i, p in enumerate(pat.split(text)))
+
+
+def clear_study_search():
+    st.session_state.study_q = ""
+
+
 def render_study():
     s = st.session_state
-    q = st.text_input("검색 (한자·뜻·음)", key="study_q", placeholder="예: 하늘, 천, 天")
+    with st.form("study_form", border=False):
+        c1, c2 = st.columns([5, 2], vertical_alignment="bottom")
+        q = c1.text_input("한자·뜻·음 검색", key="study_q", placeholder="🔍 예: 天 / 하늘 / 천  (여러 개는 띄어쓰기)")
+        c2.form_submit_button("🔍 검색", type="primary", width="stretch")
+    terms = _terms(q)
     c1, c2 = st.columns(2)
     hide = c1.toggle("암기 모드 (뜻·음 가리기, 눌러서 확인)", value=False)
     view = c2.radio("보기", ["카드", "표"], horizontal=True, label_visibility="collapsed")
-    words = s.words
-    if q.strip():
-        qq = q.strip().lower()
-        words = [w for w in words if qq in (w["hanja"] + w["meaning"] + w["sound"] + w.get("group", "")).lower()]
-    st.caption(f"{len(words)}개")
+    total = len(s.words)
+    words = [w for w in s.words if word_matches(w, terms)] if terms else list(s.words)
+    if terms:  # 글자가 정확히 같은 한자·음을 앞으로
+        words.sort(key=lambda w: 0 if any(t in (w["hanja"].lower(), w["sound"].lower()) for t in terms) else 1)
+        r1, r2 = st.columns([5, 2], vertical_alignment="center")
+        r1.caption(f"'{q.strip()}' 검색 결과 {len(words)}개 (전체 {total}개 중)")
+        r2.button("✖ 검색 지우기", on_click=clear_study_search, width="stretch")
+        if not words:
+            st.info("검색 결과가 없어요. 한자를 입력하기 어렵다면 뜻이나 음(예: 하늘, 천)으로 찾아보세요.")
+    else:
+        st.caption(f"{total}개 · 검색어를 입력하고 엔터(또는 검색 버튼)를 누르세요")
     if view == "표":
         df = pd.DataFrame(words).rename(columns={"hanja": "한자", "meaning": "뜻", "sound": "음", "group": "분류"})
         if hide and len(df):
@@ -1970,10 +2036,10 @@ def render_study():
     else:
         cards = []
         for w in words:
-            mean = f"<b>{esc(w['meaning'])}</b> {esc(w['sound'])}"
+            mean = f"<b>{highlight(w['meaning'], terms)}</b> {highlight(w['sound'], terms)}"
             body = f"<details><summary>보기</summary>{mean}</details>" if hide else mean
             g = f"<div class='g'>{esc(w['group'])}</div>" if w.get("group") else ""
-            cards.append(f"<div class='wcard'><div class='h'>{esc(w['hanja'])}</div><div class='m'>{body}</div>{g}</div>")
+            cards.append(f"<div class='wcard'><div class='h'>{highlight(w['hanja'], terms)}</div><div class='m'>{body}</div>{g}</div>")
         html("<div class='wgrid'>" + "".join(cards) + "</div>")
     st.divider()
     render_sheet()
@@ -2153,6 +2219,8 @@ def sidebar():
             load_panel()
     st.sidebar.number_input("오늘의 목표 (문제 수)", 5, 500, step=5, key="set_goal")
     st.sidebar.slider("펜 굵기", 3, 20, key="set_stroke")
+    st.sidebar.slider("쓰는 칸 크기", 200, 400, step=20, key="set_canvas",
+                      help="한자를 쓰는 칸의 크기예요. 화면이 작으면 줄이세요. (바꾸면 쓰던 글씨는 지워져요)")
     grading_sidebar()
 
     with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
@@ -2182,6 +2250,7 @@ def sidebar():
         st.write(f"캔버스 라이브러리: {'정상' if HAS_CANVAS else '불러오기 실패'}")
         st.write(f"한자 폰트: {find_font() or '없음'} ({_FONT['source'] or '-'})")
         st.write("자동 저장: " + {True: "켜짐", False: "이 브라우저에서는 사용할 수 없음", None: "확인 중"}[s.store_ok])
+        st.caption("화면이 이상하게 동작하면 주소 끝에 ?nostore=1 을 붙여 접속해 보세요. (자동 저장 없이 실행)")
         st.divider()
         st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
         st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
@@ -2221,7 +2290,10 @@ def run_app():
 def main():
     init_state()
     inject_css()  # 먼저 깔아서, 저장용 보이지 않는 조각이 잠깐이라도 보이지 않게
-    sync_browser_store()
+    if st.query_params.get("nostore"):  # 진단용: 주소 끝에 ?nostore=1 을 붙이면 브라우저 자동 저장을 끄고 실행
+        st.session_state.restored, st.session_state.store_ok = True, False
+    else:
+        sync_browser_store()
     try:
         run_app()
     except Exception:  # 예상 못 한 오류가 나도 하얀 화면 대신 복구 버튼을 보여줘요
