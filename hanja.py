@@ -12,6 +12,7 @@ import html as htmllib
 import inspect
 import io
 import json
+import math
 import os
 import random
 import re
@@ -228,13 +229,13 @@ def parse_file(f):
     elif name.endswith(".csv"):
         try:
             df = pd.read_csv(
-                io.StringIO(decode_bytes(data)), header=None, dtype=str, keep_default_na=False
+                io.StringIO(strip_comments(decode_bytes(data))), header=None, dtype=str, keep_default_na=False
             )
             rows = parse_table(df)
         except Exception:
-            rows = parse_text(decode_bytes(data))
+            rows = parse_text(strip_comments(decode_bytes(data)))
     else:
-        rows = parse_text(decode_bytes(data))
+        rows = parse_text(strip_comments(decode_bytes(data)))
 
     return build_words(rows)
 
@@ -728,6 +729,14 @@ SETTING_DEFAULTS = dict(
     set_type="섞어서", set_source="전체 단어", set_count=10, set_shuffle=True, set_groups=[],
     set_goal=20, set_stroke=8, set_canvas=280,
     card_src="전체 단어", card_dir="한자 → 뜻·음", card_shuffle=True, card_count=20,
+    # 시험 플랜
+    set_exam_date="", set_target=90, plan_groups=[],
+    # 사자성어
+    idm_view="시험", idm_src="전체", idm_type="섞어서", idm_count=10, idm_groups=[],
+    # 모의고사
+    ex_src="전체 단어", ex_groups=[], ex_apply="반영해요",
+    ex_n_ko=10, ex_n_write=5, ex_n_choice=5, ex_n_idiom=0,
+    ex_pt_ko=5.0, ex_pt_write=5.0, ex_pt_choice=5.0, ex_pt_idiom=5.0,
 )
 KEEP_KEYS = list(SETTING_DEFAULTS)  # 화면에 없는 동안에도 값이 사라지지 않게 붙잡아 둘 설정들
 
@@ -753,6 +762,10 @@ def init_state():
         wrong={}, stats={}, nonce=0, retry_mode=False, hint=False, flash="",
         progress_sig=None, calib=[], set_preset="보통", srs={}, history={}, cards=None, sheet=None,
         restored=False, store_ok=None,
+        notes={}, idioms=[], idiom_stats={}, idiom_wrong={}, exams=[],
+        iquiz=[], ipos=0, ires=[], inonce=0, iretry=False, idm_confirm="",
+        exam=None, exam_result=None, ex_nonce=0, ex_quit=False,
+        ed_ver=0, ied_ver=0, notice=None, hw_clear=0,
     )
     defaults.update(GRADE_DEFAULTS)
     defaults.update(SETTING_DEFAULTS)
@@ -871,20 +884,26 @@ def make_item(w, ty):
     return item
 
 
-def start_quiz():
+def start_quiz(pool_override=None, count_override=None):
     s = st.session_state
-    source = s.get("set_source", "전체 단어")
+    source = "오늘 복습할 것" if pool_override is not None else s.get("set_source", "전체 단어")
     kind = s.get("set_type", "섞어서")
     groups = s.get("set_groups", [])
-    if source == "오답 노트만":
+    if pool_override is not None:  # 시험 플랜: 오늘 복습 + 새 한자를 묶어서 시작
+        pool = list(pool_override)
+    elif source == "오답 노트만":
         pool = list(s.wrong.values())
     else:
         pool = [w for w in s.words if not groups or w.get("group") in groups]
+        if source == "별표 한자만":
+            pool = [w for w in pool if is_star(w["hanja"])]
         if source == "오늘 복습할 것":
             pool = due_pool(pool)
     if not pool:
         if source == "오늘 복습할 것":
             s.flash = "오늘 복습할 한자가 없어요. 내일 다시 만나요! 🎉"
+        elif source == "별표 한자만":
+            s.flash = "별표를 준 한자가 없어요. 단어장 탭에서 ★를 눌러 주세요."
         else:
             s.flash = "문제로 만들 단어가 없어요. 파일을 올리거나 범위·오답 노트를 확인해 주세요."
         return
@@ -914,7 +933,7 @@ def start_quiz():
     shuffle = s.get("set_shuffle", True)
     if shuffle and source != "오늘 복습할 것":
         random.shuffle(pool)
-    count = int(s.get("set_count", 10))
+    count = int(count_override or s.get("set_count", 10))
     items = []
     for w in pool:
         ty = pick_type(w)
@@ -1005,10 +1024,582 @@ def reset_all():
     """퀴즈 + 오답 노트 + 통계 + 복습 기록 전부 초기화 (불러온 단어는 유지)"""
     s = st.session_state
     s.wrong, s.stats, s.srs, s.history = {}, {}, {}, {}
+    s.idiom_stats, s.idiom_wrong, s.exams = {}, {}, []
     s.cards = None
+    s.exam, s.exam_result, s.ex_quit = None, None, False
+    reset_idiom_quiz()
     reset_quiz()
     s.confirm_reset = False
-    s.flash = "퀴즈, 오답 노트, 통계, 복습 기록을 모두 초기화했어요."
+    s.flash = "퀴즈, 오답 노트, 통계, 복습·시험 기록을 모두 초기화했어요. (단어장·사자성어·메모는 그대로예요)"
+
+
+# ----------------------------------------------------------------------
+# 새 기능 공통: 상한 · 검증 · 폴더 내장 세트 · 메모/별표 · 단어장 편집
+# ----------------------------------------------------------------------
+MAX_NOTE = 200  # 메모 한 개의 최대 글자 수
+MAX_NOTES = 3000  # 저장하는 메모·별표 개수 (브라우저 저장 용량을 지키려는 상한)
+MAX_IDIOMS = 2000  # 사자성어 개수
+MAX_EXAMS = 100  # 모의고사 기록 개수
+IDIOM_MIN, IDIOM_MAX = 3, 8  # 사자성어 한자 글자 수
+MAX_SET_BYTES = 2_000_000  # 폴더 CSV 한 개의 최대 크기
+
+EXAM_ORDER = ["ko", "write", "choice", "idiom"]
+EXAM_TYPES = {
+    "ko": "한자 → 뜻·음 쓰기",
+    "write": "뜻·음 → 한자 쓰기 (손글씨)",
+    "choice": "객관식",
+    "idiom": "사자성어",
+}
+EXAM_SRC = ["전체 단어", "분류 선택", "별표 한자만", "오답 노트만"]
+IDIOM_LABELS = {
+    "i_read": "사자성어 → 독음 쓰기",
+    "i_ch_snd": "독음 → 사자성어 고르기",
+    "i_ch_ko": "사자성어 → 뜻 고르기",
+    "i_ch_hj": "뜻 → 사자성어 고르기",
+    "i_blank": "빈칸 채우기 (고르기)",
+    "i_hw": "빈칸 한 글자 손글씨",
+}
+IDIOM_KINDS = ["섞어서", "독음 쓰기", "독음 → 사자성어", "뜻 고르기", "빈칸 고르기", "빈칸 손글씨"]
+IDIOM_KIND_TYPES = {
+    "독음 쓰기": ["i_read"],
+    "독음 → 사자성어": ["i_ch_snd"],
+    "뜻 고르기": ["i_ch_ko", "i_ch_hj"],
+    "빈칸 고르기": ["i_blank"],
+    "빈칸 손글씨": ["i_hw"],
+}
+IDIOM_SRC = ["전체", "분류 선택", "오답 노트만"]
+SOURCES = ["전체 단어", "오늘 복습할 것", "오답 노트만", "별표 한자만"]
+
+
+def _dict(x):
+    return x if isinstance(x, dict) else {}
+
+
+def _flt(x, default=0.0, lo=0.0, hi=1e9):
+    try:
+        v = float(x)
+    except Exception:
+        return default
+    if not math.isfinite(v):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _cell(x):
+    """표 칸 값 -> 문자열 (비어 있으면 '')"""
+    try:
+        if x is None or pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+
+def _all_hanja(x):
+    return bool(x) and all(has_hanja(c) for c in x)
+
+
+def fmt_pts(x):
+    return f"{float(x):.1f}".rstrip("0").rstrip(".")
+
+
+def fmt_secs(n):
+    n = int(n)
+    return f"{n // 60}분 {n % 60}초" if n >= 60 else f"{n}초"
+
+
+def now_kst_str():
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def strip_comments(text):
+    """'#'으로 시작하는 줄은 메모로 보고 무시해요 (예시 파일의 '검수 필요' 안내용)"""
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip("\ufeff \t").startswith("#"))
+
+
+# --- 검증 ---------------------------------------------------------------------
+def word_problem(h, m, sd, g=""):
+    """한자 한 개 입력의 문제점 (없으면 '')"""
+    if not h:
+        return "한자가 비어 있어요"
+    if not has_hanja(h):
+        return "한자가 아닌 글자예요"
+    if len(h) > 12:
+        return "한자가 너무 길어요 (12자 이하)"
+    if not sd:
+        return "음이 비어 있어요"
+    if len(m) > 100 or len(sd) > 60 or len(g) > 30:
+        return "뜻(100자)·음(60자)·분류(30자)가 너무 길어요"
+    return ""
+
+
+def idiom_problem(h, sd, mn):
+    if not h:
+        return "사자성어(한자)가 비어 있어요"
+    if not _all_hanja(h):
+        return "한자가 아닌 글자가 섞여 있어요"
+    if not (IDIOM_MIN <= len(h) <= IDIOM_MAX):
+        return f"한자는 {IDIOM_MIN}~{IDIOM_MAX}자여야 해요 (지금 {len(h)}자)"
+    if not sd:
+        return "독음이 비어 있어요"
+    if not mn:
+        return "뜻이 비어 있어요"
+    if len(sd) > 60 or len(mn) > 300:
+        return "독음(60자)이나 뜻(300자)이 너무 길어요"
+    return ""
+
+
+def _clean_idiom(it):
+    if not isinstance(it, dict):
+        return None
+    h = re.sub(r"\s+", "", str(it.get("hanja", "")))
+    sd, mn = str(it.get("sound", "")).strip(), str(it.get("meaning", "")).strip()
+    if idiom_problem(h, sd, mn):
+        return None
+    return {"hanja": h, "sound": sd, "meaning": mn, "group": str(it.get("group", "")).strip()[:30]}
+
+
+def _clean_idioms(lst):
+    out, seen = [], set()
+    for it in lst if isinstance(lst, list) else []:
+        c = _clean_idiom(it)
+        if c and c["hanja"] not in seen:
+            seen.add(c["hanja"])
+            out.append(c)
+            if len(out) >= MAX_IDIOMS:
+                break
+    return out
+
+
+def _clean_notes(d):
+    out = {}
+    for k, v in _dict(d).items():
+        if len(out) >= MAX_NOTES:
+            break
+        if not isinstance(v, dict) or not has_hanja(str(k)):
+            continue
+        note = str(v.get("note", "") or "").strip()[:MAX_NOTE]
+        star = v.get("star") is True
+        if note or star:
+            out[str(k)[:30]] = {"note": note, "star": star}
+    return out
+
+
+def _clean_exam(e):
+    if not isinstance(e, dict):
+        return None
+    day = _iso(e.get("date"))
+    if not day:
+        return None
+    full = _flt(e.get("full"), 100.0, 0.1, 10000.0)
+    types = {}
+    for k, v in _dict(e.get("types")).items():
+        if k in EXAM_TYPES and isinstance(v, dict):
+            mx = _flt(v.get("max"), 0.0, 0.0, 10000.0)
+            types[k] = {"score": round(_flt(v.get("score"), 0.0, 0.0, mx), 1), "max": round(mx, 1),
+                        "n": _int(v.get("n"), 0, 0, 1000), "right": _int(v.get("right"), 0, 0, 1000)}
+    return {"start": str(e.get("start", ""))[:19] or day, "date": day,
+            "score": round(_flt(e.get("score"), 0.0, 0.0, full), 1), "full": round(full, 1),
+            "n": _int(e.get("n"), 0, 0, 1000), "types": types, "secs": _int(e.get("secs"), 0, 0, 10**6)}
+
+
+def _clean_idiom_key(k):
+    k = str(k)
+    return k if (IDIOM_MIN <= len(k) <= IDIOM_MAX and _all_hanja(k)) else None
+
+
+# --- 같은 항목 합치기 ----------------------------------------------------------
+def _same_text(a, b):
+    """b의 뜻(음)이 a에 이미 들어 있으면 같은 걸로 봐요 ('/'로 이은 여러 답도 따로 비교)"""
+    if not norm(b):
+        return True
+    have = set(split_alts(a)) | {norm(a)}
+    return all(x in have for x in (split_alts(b) or [norm(b)]))
+
+
+def merge_items(base, incoming, fields):
+    """같은 한자는 한 번만. 뜻·음이 서로 다르면 먼저 있던 것을 유지하고 conflicts에 모아요.
+    반환: (합친 목록, 새로 들어온 수, 같아서 건너뛴 수, 뜻·음이 달라 유지한 한자들)"""
+    out = [dict(x) for x in base]
+    idx = {x["hanja"]: i for i, x in enumerate(out)}
+    added = dup = 0
+    conflicts = []
+    for it in incoming:
+        h = it["hanja"]
+        if h in idx:
+            cur = out[idx[h]]
+            if all(_same_text(cur.get(f, ""), it.get(f, "")) for f in fields):
+                dup += 1
+            else:
+                conflicts.append(h)
+            if not cur.get("group") and it.get("group"):
+                cur["group"] = it["group"]
+            continue
+        idx[h] = len(out)
+        out.append(dict(it))
+        added += 1
+    return out, added, dup, conflicts
+
+
+# --- 폴더(wordsets/, idioms/)의 내장 세트 --------------------------------------
+def _app_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+WORDSET_DIR = os.path.join(_app_dir(), "wordsets")
+IDIOM_DIR = os.path.join(_app_dir(), "idioms")
+SET_KINDS = {
+    "word": dict(dir=WORDSET_DIR, folder="wordsets", label="단어장", obj="단어장을", fields=("meaning", "sound")),
+    "idiom": dict(dir=IDIOM_DIR, folder="idioms", label="사자성어", obj="사자성어를", fields=("meaning", "sound")),
+}
+
+
+def set_title(fname):
+    return os.path.splitext(fname)[0].replace("_", " ").strip() or fname
+
+
+def list_sets(folder):
+    """폴더의 CSV 목록 -> [(세트 이름, 경로)]. 폴더가 없거나 비어 있으면 빈 목록"""
+    try:
+        names = sorted(n for n in os.listdir(folder)
+                       if n.lower().endswith(".csv") and not n.startswith((".", "~")))
+    except Exception:
+        return []
+    out, seen = [], set()
+    for n in names[:100]:
+        p = os.path.join(folder, n)
+        if not os.path.isfile(p):
+            continue
+        t = set_title(n)
+        if t in seen:  # 이름이 겹치면 파일 이름 그대로
+            t = n
+        seen.add(t)
+        out.append((t, p))
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _read_set_cached(path, mtime, size, kind):
+    with open(path, "rb") as f:
+        data = f.read(MAX_SET_BYTES + 1)
+    if len(data) > MAX_SET_BYTES:
+        raise ValueError("파일이 너무 커요 (2MB 이하만 읽어요)")
+    text = strip_comments(decode_bytes(data))
+    parse = parse_table if kind == "word" else parse_idiom_table
+    try:
+        df = pd.read_csv(io.StringIO(text), header=None, dtype=str, keep_default_na=False)
+        return parse(df)
+    except Exception:
+        return parse_text(text) if kind == "word" else parse_idiom_text(text)
+
+
+def read_set_rows(path, kind):
+    try:
+        info = os.stat(path)
+        return _read_set_cached(path, info.st_mtime, info.st_size, kind), ""
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+def clear_notice():
+    st.session_state.notice = None
+
+
+def show_notice(kind, tag):
+    s = st.session_state
+    n = s.get("notice")
+    if isinstance(n, dict) and n.get("kind") == kind and n.get("msgs"):
+        for m in n["msgs"]:
+            st.warning(m)
+        st.button("확인했어요", key=f"notice_ok_{tag}", on_click=clear_notice)
+
+
+def load_builtin(kind, tag):
+    """고른 내장 세트를 불러와요 (바꾸기 / 합치기). 버튼 콜백으로 실행돼요"""
+    s = st.session_state
+    cfg = SET_KINDS[kind]
+    sets = dict(list_sets(cfg["dir"]))
+    picked = [n for n in s.get(f"ws_pick_{tag}", []) if n in sets]
+    if not picked:
+        s.flash = f"불러올 {cfg['obj']} 먼저 골라 주세요."
+        return
+    notes, conflicts, incoming = [], [], []
+    for name in picked:
+        rows, err = read_set_rows(sets[name], kind)
+        if err:
+            notes.append(f"'{name}'을(를) 읽지 못했어요: {err}")
+            continue
+        if kind == "word":
+            items, dropped, _m = build_words(rows)
+            if dropped:
+                notes.append(f"'{name}': 뜻·음이 없어서 제외한 줄 {dropped}개")
+        else:
+            items, probs, _d = build_idioms(rows)
+            if probs:
+                notes.append(f"'{name}': 제외한 줄 {len(probs)}개 (예: {probs[0]})")
+        incoming, _a, _d2, conf = merge_items(incoming, items, cfg["fields"])
+        conflicts += conf
+    if not incoming:
+        s.notice = {"kind": kind, "msgs": notes or ["읽을 수 있는 항목이 없었어요."]}
+        s.flash = "읽을 수 있는 항목이 없었어요."
+        return
+    mode = s.get(f"ws_mode_{tag}", "바꾸기")
+    base = (s.words if kind == "word" else s.idioms) if mode != "바꾸기" else []
+    merged, added, dup, conf2 = merge_items(base, incoming, cfg["fields"])
+    conflicts += conf2
+    if kind == "word":
+        s.words = merged
+        reset_views()
+    else:
+        if len(merged) > MAX_IDIOMS:
+            notes.append(f"사자성어는 최대 {MAX_IDIOMS}개까지만 담아요. 넘는 {len(merged) - MAX_IDIOMS}개는 뺐어요.")
+        s.idioms = merged[:MAX_IDIOMS]
+        reset_idiom_quiz()
+    if conflicts:
+        notes.append(f"같은 한자인데 뜻·음이 달라서 '먼저 있던 것'을 유지한 항목이 {len(conflicts)}개 있어요: "
+                     + ", ".join(conflicts[:10]) + (" …" if len(conflicts) > 10 else ""))
+    s.notice = {"kind": kind, "msgs": notes} if notes else None
+    msg = f"{cfg['label']} {len(picked)}개 세트를 불러왔어요. (새 항목 {added}개 · 겹쳐서 한 번만 담은 것 {dup}개)"
+    if conflicts:
+        msg += " ⚠️ 뜻·음이 달라 유지한 항목이 있어요. 안내를 확인해 주세요."
+    s.flash = msg
+
+
+def set_picker(kind, tag, show=True):
+    """내장 세트 고르기 (처음 화면 / 단어장 탭 / 사자성어 관리에서 같이 써요)"""
+    s = st.session_state
+    cfg = SET_KINDS[kind]
+    if show:
+        show_notice(kind, tag)
+    sets = list_sets(cfg["dir"])
+    if not sets:
+        st.caption(f"📂 내장 {cfg['label']}이 아직 없어요. 앱 폴더의 {cfg['folder']}/ 폴더에 CSV 파일을 넣으면 여기에 목록이 나와요.")
+        return
+    names = [n for n, _ in sets]
+    pk, mk = f"ws_pick_{tag}", f"ws_mode_{tag}"
+    s[pk] = [x for x in s.get(pk, []) if x in names]
+    merge_label = "지금 단어장에 합치기" if kind == "word" else "지금 사자성어에 합치기"
+    modes = ["바꾸기", merge_label]
+    if s.get(mk) not in modes:
+        s[mk] = merge_label if (s.words if kind == "word" else s.idioms) else "바꾸기"
+    with st.form(f"ws_form_{tag}", border=False):
+        st.multiselect(f"내장 {cfg['label']} 고르기 (여러 개 가능)", names, key=pk, placeholder="눌러서 고르기")
+        st.radio("불러오는 방법", modes, key=mk, horizontal=True,
+                 help="같은 한자는 한 번만 담아요. 뜻·음이 서로 다르면 먼저 있던 것을 유지하고 알려 드려요.")
+        st.form_submit_button(f"📂 {cfg['label']} 불러오기", type="primary", on_click=load_builtin, args=(kind, tag), width="stretch")
+    st.caption(f"{cfg['folder']}/ 폴더의 CSV {len(sets)}개 · 파일 이름이 세트 이름이에요. 열: "
+               + ("한자, 뜻, 음, 분류(선택)" if kind == "word" else "사자성어, 독음, 뜻, 분류(선택)"))
+
+
+# --- 사자성어 읽기 ---------------------------------------------------------------
+IDIOM_ALIASES = {
+    "hanja": ["사자성어", "성어", "한자", "hanja", "idiom"],
+    "sound": ["독음", "음", "읽기", "sound", "reading"],
+    "meaning": ["뜻", "의미", "해석", "meaning"],
+    "group": ["분류", "단원", "급수", "group", "category", "chapter"],
+}
+
+
+def parse_idiom_table(df):
+    df = df.fillna("").astype(str)
+    if df.empty:
+        return []
+    first = [x.strip().lower() for x in df.iloc[0]]
+    cols = {"hanja": 0, "sound": 1, "meaning": 2, "group": 3 if df.shape[1] >= 4 else None}
+    start = 0
+    if not any(has_hanja(x) for x in first):  # 첫 줄이 헤더
+        start, cols["group"] = 1, None
+        for key, names in IDIOM_ALIASES.items():
+            for i, h in enumerate(first):
+                if h in [n.lower() for n in names]:
+                    cols[key] = i
+    rows = []
+    for _, r in df.iloc[start:].iterrows():
+        vals = list(r)
+
+        def get(i):
+            return vals[i].strip() if i is not None and i < len(vals) else ""
+
+        rows.append((get(cols["hanja"]), get(cols["sound"]), get(cols["meaning"]), get(cols["group"])))
+    return rows
+
+
+def parse_idiom_text(text, group=""):
+    """한 줄에 '一石二鳥 일석이조 한 가지 일로 두 가지 이익을 얻음' (공백 구분).
+    탭·'|'·';'로 나눠도 되고, '한자,독음,뜻'처럼 쉼표도 돼요. '#'으로 시작하는 줄은 무시해요."""
+    rows = []
+    for ln in text.splitlines():
+        ln = ln.strip().lstrip("\ufeff")
+        if not ln or ln.startswith("#"):
+            continue
+        if re.search(r"[\t|;]", ln):
+            parts = [p.strip() for p in re.split(r"[\t|;]", ln, maxsplit=3)]
+        elif "," in ln and _all_hanja(ln.split(",", 1)[0].strip()):
+            parts = [p.strip() for p in ln.split(",", 2)]
+        else:
+            parts = ln.split(None, 2)
+        parts += [""] * (4 - len(parts))
+        rows.append((parts[0], parts[1], parts[2], parts[3] or group))
+    return rows
+
+
+def parse_idiom_file(f):
+    name, data = f.name.lower(), f.getvalue()
+    if name.endswith((".xlsx", ".xls")):
+        return parse_idiom_table(pd.read_excel(io.BytesIO(data), header=None, dtype=str))
+    text = strip_comments(decode_bytes(data))
+    if name.endswith(".csv"):
+        try:
+            return parse_idiom_table(pd.read_csv(io.StringIO(text), header=None, dtype=str, keep_default_na=False))
+        except Exception:
+            pass
+    return parse_idiom_text(text)
+
+
+def build_idioms(rows):
+    """줄 목록 -> (사자성어 목록, 문제 있는 줄 설명들, 같은 사자성어 중복 수)"""
+    out, idx, problems, dup = [], {}, [], 0
+    for n, row in enumerate(rows, 1):
+        h = re.sub(r"\s+", "", row[0])
+        sd, mn = row[1].strip(), row[2].strip()
+        g = (row[3] if len(row) > 3 else "").strip()
+        if not (h or sd or mn):
+            continue
+        why = idiom_problem(h, sd, mn)
+        if why:
+            problems.append(f"{n}번째 줄 ({h or '한자 없음'}): {why}")
+            continue
+        if h in idx:
+            dup += 1
+            if g and not out[idx[h]]["group"]:
+                out[idx[h]]["group"] = g[:30]
+            continue
+        idx[h] = len(out)
+        out.append({"hanja": h, "sound": sd, "meaning": mn, "group": g[:30]})
+    return out, problems, dup
+
+
+# --- 메모 · 별표 -----------------------------------------------------------------
+def is_star(h):
+    return bool(st.session_state.notes.get(h, {}).get("star"))
+
+
+def note_of(h):
+    return st.session_state.notes.get(h, {}).get("note", "")
+
+
+def _put_note(h, note, star):
+    s = st.session_state
+    note = str(note).strip()[:MAX_NOTE]
+    if note or star:
+        if h not in s.notes and len(s.notes) >= MAX_NOTES:
+            return False
+        s.notes[h] = {"note": note, "star": bool(star)}
+    else:
+        s.notes.pop(h, None)
+    return True
+
+
+def toggle_star(h, on):
+    _put_note(h, note_of(h), on)
+
+
+def bulk_star(on):
+    s = st.session_state
+    n = 0
+    for h in s.get("nt_bulk", []):
+        n += int(_put_note(h, note_of(h), on))
+    s.nt_bulk = []
+    s.flash = f"{n}개 한자에 별표를 {'줬어요' if on else '뺐어요'}."
+
+
+def save_note(h, text):
+    ok = _put_note(h, text, is_star(h))
+    st.toast("메모를 저장했어요." if ok else f"메모·별표는 최대 {MAX_NOTES}개까지만 저장해요.")
+
+
+def show_memo(h):
+    n = note_of(h)
+    if n:
+        html(f"<div class='memo'>📝 내 메모<br>{esc(n)}</div>")
+
+
+# --- 단어장 편집 -------------------------------------------------------------------
+WORD_COLS = ["한자", "뜻", "음", "분류"]
+
+
+def words_df(words):
+    return pd.DataFrame(
+        [{"한자": w["hanja"], "뜻": w["meaning"], "음": w["sound"], "분류": w.get("group", "")} for w in words],
+        columns=WORD_COLS,
+    )
+
+
+def words_csv(words):
+    return words_df(words).to_csv(index=False).encode("utf-8-sig")
+
+
+def words_from_df(df):
+    """편집 표 -> (단어 목록, 오류 목록). 오류가 하나라도 있으면 저장하지 않아요"""
+    words, errors, seen = [], [], {}
+    for i, (_, r) in enumerate(df.iterrows(), 1):
+        h = re.sub(r"\s+", "", _cell(r.get("한자")))
+        m, sd, g = _cell(r.get("뜻")), _cell(r.get("음")), _cell(r.get("분류"))
+        if not (h or m or sd or g):
+            continue  # 완전히 빈 줄은 무시
+        why = word_problem(h, m, sd, g)
+        if why:
+            errors.append(f"{i}번째 줄 ({h or '한자 없음'}): {why}")
+            continue
+        if h in seen:
+            errors.append(f"{i}번째 줄 ({h}): {seen[h]}번째 줄과 같은 한자예요. 다른 음은 '행/항'처럼 / 로 이어서 한 줄에 적어 주세요")
+            continue
+        seen[h] = i
+        words.append({"hanja": h, "meaning": m, "sound": sd, "group": g})
+    return words, errors
+
+
+def reset_views():
+    """단어장이 바뀔 때: 진행 중이던 퀴즈·카드·시험지·모의고사를 안전하게 비워요 (기록은 그대로)"""
+    s = st.session_state
+    s.quiz, s.pos, s.results, s.feedback, s.cards, s.sheet = [], 0, [], None, None, None
+    s.hint = False
+    s.nonce += 1
+    s.exam, s.ex_quit = None, False
+    s.ex_nonce += 1
+
+
+def reset_idiom_quiz():
+    s = st.session_state
+    s.iquiz, s.ipos, s.ires = [], 0, []
+    s.inonce += 1
+
+
+def commit_words(new_words):
+    """편집 결과를 단어장에 반영해요. 뜻·음을 고치면 오답 노트·통계에 복사돼 있는 값도 같이 바꿔요.
+    (한자 글자를 바꾸면 '삭제 + 새 단어'가 돼요. 삭제한 한자의 기록은 지우지 않고 남겨 둬요)"""
+    s = st.session_state
+    old = {w["hanja"]: w for w in s.words}
+    new_keys = {w["hanja"] for w in new_words}
+    changed = 0
+    for w in new_words:
+        o = old.get(w["hanja"])
+        if o and (o["meaning"] != w["meaning"] or o["sound"] != w["sound"]):
+            changed += 1
+            for book in (s.wrong, s.stats):
+                e = book.get(w["hanja"])
+                if e:
+                    e["meaning"], e["sound"] = w["meaning"], w["sound"]
+    added = sum(1 for w in new_words if w["hanja"] not in old)
+    removed = sum(1 for h in old if h not in new_keys)
+    s.words = new_words
+    reset_views()
+    s.ed_ver += 1
+    s.flash = (f"단어장을 저장했어요. (추가 {added} · 수정 {changed} · 삭제 {removed}) "
+               "진행 중이던 퀴즈·카드는 안전하게 비웠어요. 새로 시작해 주세요.")
 
 
 # ----------------------------------------------------------------------
@@ -1056,11 +1647,23 @@ STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body st
 PERSIST_KEYS = [
     "set_goal", "set_stroke", "set_canvas", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
     "card_src", "card_dir", "card_shuffle", "card_count",
+    "set_exam_date", "set_target", "plan_groups", "idm_src", "idm_type", "idm_count",
+    "ex_src", "ex_apply",
+    "ex_n_ko", "ex_n_write", "ex_n_choice", "ex_n_idiom",
+    "ex_pt_ko", "ex_pt_write", "ex_pt_choice", "ex_pt_idiom",
 ] + list(GRADE_DEFAULTS)
+# 저장값 범위 (엉뚱한 값이 들어 있어도 위젯이 깨지지 않게 이 안으로 맞춰요)
+SETTING_RANGES = {"set_target": (0, 100), "idm_count": (5, 50)}
+SETTING_RANGES.update({f"ex_n_{k}": (0, 100) for k in EXAM_ORDER})
+SETTING_RANGES.update({f"ex_pt_{k}": (0.0, 100.0) for k in EXAM_ORDER})
 ALLOWED = {
     "set_type": ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"],
-    "set_source": ["전체 단어", "오늘 복습할 것", "오답 노트만"],
-    "card_src": ["전체 단어", "오늘 복습할 것", "오답 노트만"],
+    "set_source": SOURCES,
+    "card_src": SOURCES,
+    "idm_src": IDIOM_SRC,
+    "idm_type": IDIOM_KINDS,
+    "ex_src": EXAM_SRC,
+    "ex_apply": ["반영해요", "반영 안 해요"],
     "card_dir": ["한자 → 뜻·음", "뜻·음 → 한자"],
     "set_preset": ["관대", "보통", "엄격", "직접 설정"],
 }
@@ -1092,29 +1695,51 @@ def _clean_word(w):
 
 def sanitize_progress(d):
     """파일/브라우저에서 읽은 기록을 검사해서, 엉뚱한 값이 섞여 있어도 앱이 깨지지 않게 걸러 줘요"""
-    out = {"wrong": {}, "stats": {}, "srs": {}, "history": {}}
+    out = {"wrong": {}, "stats": {}, "srs": {}, "history": {}, "notes": {}, "idioms": [],
+           "idiom_stats": {}, "idiom_wrong": {}, "exams": [], "plan": {}}
     if not isinstance(d, dict):
         return out
-    for k, v in (d.get("wrong") or {}).items():
+    for k, v in _dict(d.get("wrong")).items():
         if isinstance(v, dict) and has_hanja(str(k)):
             out["wrong"][str(k)] = {
                 "hanja": str(k), "meaning": str(v.get("meaning", "")), "sound": str(v.get("sound", "")),
                 "wrong_count": _int(v.get("wrong_count"), 1, 1), "last": str(v.get("last", "")),
             }
-    for k, v in (d.get("stats") or {}).items():
+    for k, v in _dict(d.get("stats")).items():
         if isinstance(v, dict) and has_hanja(str(k)):
             out["stats"][str(k)] = {
                 "meaning": str(v.get("meaning", "")), "sound": str(v.get("sound", "")),
                 "right": _int(v.get("right")), "wrong": _int(v.get("wrong")),
             }
-    for k, v in (d.get("srs") or {}).items():
+    for k, v in _dict(d.get("srs")).items():
         due = _iso(v.get("due")) if isinstance(v, dict) else None
         if due and has_hanja(str(k)):
             out["srs"][str(k)] = {"box": _int(v.get("box"), 0, 0, len(INTERVALS) - 1), "due": due,
                                   "seen": _int(v.get("seen"))}
-    for day, v in (d.get("history") or {}).items():
+    for day, v in _dict(d.get("history")).items():
         if isinstance(v, dict) and _iso(day):
             out["history"][_iso(day)] = {"right": _int(v.get("right")), "wrong": _int(v.get("wrong"))}
+    # 새 항목 (옛 저장값에는 없으니 없으면 빈 값)
+    out["notes"] = _clean_notes(d.get("notes"))
+    out["idioms"] = _clean_idioms(d.get("idioms"))
+    for k, v in _dict(d.get("idiom_stats")).items():
+        if isinstance(v, dict) and _clean_idiom_key(k):
+            out["idiom_stats"][str(k)] = {"sound": str(v.get("sound", "")), "meaning": str(v.get("meaning", "")),
+                                          "right": _int(v.get("right")), "wrong": _int(v.get("wrong"))}
+    for k, v in _dict(d.get("idiom_wrong")).items():
+        if isinstance(v, dict) and _clean_idiom_key(k) and str(v.get("sound", "")).strip() and str(v.get("meaning", "")).strip():
+            out["idiom_wrong"][str(k)] = {
+                "hanja": str(k), "sound": str(v.get("sound", "")), "meaning": str(v.get("meaning", "")),
+                "wrong_count": _int(v.get("wrong_count"), 1, 1), "last": str(v.get("last", ""))}
+    exams = [c for c in (_clean_exam(e) for e in (d.get("exams") if isinstance(d.get("exams"), list) else [])) if c]
+    out["exams"] = sorted(exams, key=lambda e: e["start"])[-MAX_EXAMS:]
+    p = _dict(d.get("plan"))
+    if "exam_date" in p:
+        out["plan"]["exam_date"] = _iso(p["exam_date"]) or ""
+    if "target" in p:
+        out["plan"]["target"] = _int(p["target"], 90, 0, 100)
+    if isinstance(p.get("groups"), list):
+        out["plan"]["groups"] = [x[:60] for x in p["groups"] if isinstance(x, str)][:100]
     return out
 
 
@@ -1127,19 +1752,47 @@ def merge_progress(clean):
         cur = s.history.setdefault(day, {"right": 0, "wrong": 0})
         cur["right"] = max(cur["right"], v["right"])
         cur["wrong"] = max(cur["wrong"], v["wrong"])
+    s.notes.update(clean.get("notes", {}))
+    have = {i["hanja"] for i in s.idioms}  # 사자성어는 이미 있는 것을 유지하고 없는 것만 더해요
+    for it in clean.get("idioms", []):
+        if it["hanja"] not in have and len(s.idioms) < MAX_IDIOMS:
+            s.idioms.append(it)
+            have.add(it["hanja"])
+    s.idiom_stats.update(clean.get("idiom_stats", {}))
+    s.idiom_wrong.update(clean.get("idiom_wrong", {}))
+    starts = {e["start"] for e in s.exams}
+    for e in clean.get("exams", []):
+        if e["start"] not in starts:
+            s.exams.append(e)
+            starts.add(e["start"])
+    s.exams = sorted(s.exams, key=lambda e: e["start"])[-MAX_EXAMS:]
+    plan = clean.get("plan") or {}
+    if "exam_date" in plan:
+        s.set_exam_date = plan["exam_date"]
+    if "target" in plan:
+        s.set_target = plan["target"]
+    if "groups" in plan:
+        s.plan_groups = plan["groups"]
 
 
 def progress_json():
     s = st.session_state
     return json.dumps(
-        {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history}, ensure_ascii=False, indent=2
+        {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history,
+         "notes": s.notes, "idioms": s.idioms, "idiom_stats": s.idiom_stats, "idiom_wrong": s.idiom_wrong,
+         "exams": s.exams,
+         "plan": {"exam_date": s.get("set_exam_date", ""), "target": s.get("set_target", 90),
+                  "groups": s.get("plan_groups", [])}},
+        ensure_ascii=False, indent=2,
     ).encode("utf-8")
 
 
 def build_payload():
     s = st.session_state
-    data = {"v": 1, "words": s.words, "wrong": s.wrong, "stats": s.stats, "srs": s.srs,
-            "history": s.history, "settings": {k: s[k] for k in PERSIST_KEYS if k in s}}
+    data = {"v": 2, "words": s.words, "wrong": s.wrong, "stats": s.stats, "srs": s.srs,
+            "history": s.history, "notes": s.notes, "idioms": s.idioms, "idiom_stats": s.idiom_stats,
+            "idiom_wrong": s.idiom_wrong, "exams": s.exams,
+            "settings": {k: s[k] for k in PERSIST_KEYS if k in s}}
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
@@ -1160,7 +1813,10 @@ def apply_payload(raw):
                 seen.add(c["hanja"])
                 words.append(c)
         s.words = words
-    merge_progress(sanitize_progress(data))
+    try:
+        merge_progress(sanitize_progress(data))
+    except Exception:  # 저장값이 이상해도 앱이 멈추지 않게
+        pass
     defaults = dict(GRADE_DEFAULTS)
     defaults.update(SETTING_DEFAULTS)
     defaults["set_preset"] = "보통"
@@ -1170,8 +1826,18 @@ def apply_payload(raw):
                 continue
             if k == "set_canvas":  # 엉뚱한 값이 저장돼 있어도 슬라이더가 깨지지 않게 범위 안으로
                 v = _int(v, 280, 200, 400)
+            if k == "set_exam_date":
+                v = _iso(v) or ""
+            if k == "plan_groups":
+                v = [x[:60] for x in v if isinstance(x, str)][:100]
+            if k in SETTING_RANGES:
+                lo, hi = SETTING_RANGES[k]
+                v = _int(v, defaults[k], lo, hi) if isinstance(defaults[k], int) else _flt(v, defaults[k], lo, hi)
+                if k == "idm_count":
+                    v = max(5, min(50, int(round(v / 5.0)) * 5))
             s[k] = v
-    return bool(s.words or s.wrong or s.stats or s.srs or s.history)
+    return bool(s.words or s.wrong or s.stats or s.srs or s.history or s.idioms or s.notes or s.exams
+                or s.idiom_stats or s.idiom_wrong)
 
 
 @st.cache_resource(show_spinner=False)
@@ -1188,7 +1854,8 @@ def sync_browser_store():
     실패해도 앱은 평소처럼 동작해요(저장만 안 될 뿐)."""
     s = st.session_state
     save = ""
-    if s.restored and (s.words or s.wrong or s.stats or s.srs or s.history):
+    if s.restored and (s.words or s.wrong or s.stats or s.srs or s.history or s.idioms or s.notes or s.exams
+                       or s.idiom_stats or s.idiom_wrong):
         save = build_payload()  # 불러오기 전에는 저장하지 않아서, 빈 상태가 기존 기록을 덮어쓰지 않아요
     try:
         with st.container(key="store_box"):
@@ -1215,6 +1882,8 @@ def repair_state():
     s.quiz, s.pos, s.results, s.feedback, s.cards, s.sheet = [], 0, [], None, None, None
     s.hint = False
     s.nonce += 1
+    s.exam, s.exam_result, s.ex_quit = None, None, False
+    s.iquiz, s.ipos, s.ires = [], 0, []
     s.flash = "화면을 정리했어요."
 
 
@@ -1232,10 +1901,14 @@ def start_cards():
         pool = list(s.wrong.values())
     elif src == "오늘 복습할 것":
         pool = due_pool(s.words)
+    elif src == "별표 한자만":
+        pool = [w for w in s.words if is_star(w["hanja"])]
     else:
         pool = list(s.words)
     if not pool:
-        s.flash = "오늘 복습할 한자가 없어요. 🎉" if src == "오늘 복습할 것" else "카드로 만들 한자가 없어요."
+        s.flash = ("오늘 복습할 한자가 없어요. 🎉" if src == "오늘 복습할 것"
+                   else "별표를 준 한자가 없어요. 단어장 탭에서 ★를 눌러 주세요." if src == "별표 한자만"
+                   else "카드로 만들 한자가 없어요.")
         return
     if s.get("card_shuffle", True) and src != "오늘 복습할 것":
         random.shuffle(pool)
@@ -1362,6 +2035,25 @@ CSS = """
 /* 자동 저장용 보이지 않는 조각 */
 .st-key-store_box{height:0; margin:0 0 -1rem; padding:0; overflow:hidden;}
 
+/* 메모·별표 */
+.wcard{position:relative;}
+.wcard .star{position:absolute; top:4px; right:8px; color:#D99A00; font-size:1.05rem;}
+.wcard .note{font-size:.78rem; color:var(--soft); margin-top:.3rem; text-align:left; padding:0 .4rem; overflow:hidden;
+  display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; word-break:break-all;}
+.memo{max-width:520px; margin:.4rem auto .8rem; padding:.6rem .9rem; background:#FFF7E0; color:var(--ink);
+  border-left:4px solid var(--seal); border-radius:6px; white-space:pre-wrap; font-size:.98rem;}
+
+/* 모의고사·사자성어 고르기 버튼 (흰 바탕 + 어두운 글씨) */
+div[class*="st-key-xc_"] button{min-height:4rem; background:#fff; border:1.5px solid var(--line);}
+div[class*="st-key-xc_"] button, div[class*="st-key-xc_"] button p{color:var(--ink);}
+div[class*="st-key-xc_text"] button p{font-size:1.1rem;}
+div[class*="st-key-xc_hj"] button p, div[class*="st-key-xc_blank"] button p{font-family:var(--serif); font-size:2rem; line-height:1.15;}
+
+/* 탭이 많아서 모바일에서는 조금 좁게 */
+@media (max-width:640px){
+  .stTabs [data-baseweb="tab"]{padding:0 .6rem; font-size:.92rem; height:2.9rem;}
+}
+
 /* 시작 화면 3단계 */
 .steps{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:.4rem 0 1rem;}
 .step{display:flex; flex-direction:column; align-items:center; gap:.4rem; text-align:center; padding:.8rem .4rem;
@@ -1445,6 +2137,9 @@ def header():
         chips.append(f"<span class='chip'>🌱 아직 안 푼 {new}개</span>")
     if s.wrong:
         chips.append(f"<span class='chip'>📕 오답 노트 {len(s.wrong)}개</span>")
+    dd = exam_dday()
+    if dd is not None and dd >= 0:
+        chips.append(f"<span class='chip hot'>📅 시험 {'D-Day' if dd == 0 else f'D-{dd}'}</span>")
     if s.store_ok:
         chips.append("<span class='chip good'>💾 자동 저장 켜짐</span>")
     elif s.store_ok is False and s.restored:
@@ -1515,7 +2210,9 @@ def render_welcome():
     )
     st.button("✨ 샘플로 먼저 둘러보기", on_click=load_sample, width="stretch",
               help="파일이 없어도 샘플 한자 22개로 바로 체험해 볼 수 있어요.")
+    set_picker("word", "welcome")
     load_panel()
+    st.caption("🈴 사자성어와 모의고사는 단어장을 불러온 뒤 '사자성어'·'시험' 탭에서 쓸 수 있어요.")
     st.caption("💾 푼 기록과 단어장은 이 기기의 브라우저에 자동으로 저장돼서, 다시 들어오면 이어서 할 수 있어요. "
                "(다른 기기와는 따로 저장돼요)")
 
@@ -1531,13 +2228,14 @@ def quick_start():
 
 def render_home():
     s = st.session_state
+    render_plan_card()
     st.subheader("오늘은 무엇을 연습할까요?")
     new, review = due_counts(s.words)
     if review + new:
         st.button(f"⚡ 오늘 복습 바로 시작 (복습 {review} · 새 한자 {new})", on_click=quick_start, width="stretch")
     st.radio("문제 유형", ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"], key="set_type", horizontal=True,
              help="뜻·음 쓰기: 키보드로 입력 / 한자 쓰기: 손글씨 / 객관식: 4개 중 고르기")
-    st.radio("문제 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="set_source", horizontal=True,
+    st.radio("문제 범위", SOURCES, key="set_source", horizontal=True,
              help=f"'오늘 복습할 것'은 복습 날짜가 된 한자({review}개)와 아직 안 푼 한자({new}개)를 약한 것부터 골라줘요.")
     groups = sorted({w["group"] for w in s.words if w.get("group")},
                     key=lambda g: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", g)])
@@ -1786,6 +2484,8 @@ def render_feedback(q):
                 if fb.get("other"):
                     line += f" · 가장 비슷한 다른 글자 '{fb['other'][0]}' {fb['other'][1]:.2f}"
                 st.caption(line)
+    if not fb["ok"] and not fb.get("pending"):
+        show_memo(w["hanja"])
     if not fb["ok"] and not fb.get("pending") and not fb.get("choice"):
         st.button("🙋 내가 맞게 썼어요 (정정)", on_click=override_correct)
     st.button("다음 문제 ➡️", type="primary", on_click=next_question, width="stretch")
@@ -1839,7 +2539,7 @@ def render_cards():
         st.subheader("카드로 넘겨 보며 익혀요")
         st.write("카드를 보고 떠올린 뒤 뒤집어서 확인하세요. '알아요/헷갈려요'는 복습 주기에 반영돼요.")
         st.radio("카드 앞면", ["한자 → 뜻·음", "뜻·음 → 한자"], key="card_dir", horizontal=True)
-        st.radio("카드 범위", ["전체 단어", "오늘 복습할 것", "오답 노트만"], key="card_src", horizontal=True)
+        st.radio("카드 범위", SOURCES, key="card_src", horizontal=True)
         a, b = st.columns([3, 2])
         a.slider("카드 수", 5, 100, step=5, key="card_count")
         with b:
@@ -1872,6 +2572,7 @@ def render_cards():
     else:
         hanja_card(cur["hanja"])
         verdict_row_neutral(cur)
+        show_memo(cur["hanja"])
         b1, b2 = st.columns(2)
         b1.button("😊 알아요", on_click=card_mark, args=(True,), width="stretch", type="primary", key="card_known")
         b2.button("🤔 헷갈려요", on_click=card_mark, args=(False,), width="stretch", key="card_unsure")
@@ -2009,6 +2710,7 @@ def clear_study_search():
 
 def render_study():
     s = st.session_state
+    show_notice("word", "study_top")
     with st.form("study_form", border=False):
         c1, c2 = st.columns([5, 2], vertical_alignment="bottom")
         q = c1.text_input("한자·뜻·음 검색", key="study_q", placeholder="🔍 예: 天 / 하늘 / 천  (여러 개는 띄어쓰기)")
@@ -2017,8 +2719,14 @@ def render_study():
     c1, c2 = st.columns(2)
     hide = c1.toggle("암기 모드 (뜻·음 가리기, 눌러서 확인)", value=False)
     view = c2.radio("보기", ["카드", "표"], horizontal=True, label_visibility="collapsed")
+    flt = st.radio("모아 보기", ["전체", "★ 별표", "📝 메모"], horizontal=True, key="st_filter",
+                   label_visibility="collapsed")
     total = len(s.words)
     words = [w for w in s.words if word_matches(w, terms)] if terms else list(s.words)
+    if flt == "★ 별표":
+        words = [w for w in words if is_star(w["hanja"])]
+    elif flt == "📝 메모":
+        words = [w for w in words if note_of(w["hanja"])]
     if terms:  # 글자가 정확히 같은 한자·음을 앞으로
         words.sort(key=lambda w: 0 if any(t in (w["hanja"].lower(), w["sound"].lower()) for t in terms) else 1)
         r1, r2 = st.columns([5, 2], vertical_alignment="center")
@@ -2028,8 +2736,12 @@ def render_study():
             st.info("검색 결과가 없어요. 한자를 입력하기 어렵다면 뜻이나 음(예: 하늘, 천)으로 찾아보세요.")
     else:
         st.caption(f"{total}개 · 검색어를 입력하고 엔터(또는 검색 버튼)를 누르세요")
+    render_note_tools(words)
     if view == "표":
         df = pd.DataFrame(words).rename(columns={"hanja": "한자", "meaning": "뜻", "sound": "음", "group": "분류"})
+        if len(df):
+            df.insert(0, "★", ["★" if is_star(h) else "" for h in df["한자"]])
+            df["메모"] = [note_of(h) for h in df["한자"]]
         if hide and len(df):
             df["뜻"], df["음"] = "???", "?"
         st.dataframe(df, width="stretch", hide_index=True, height=480)
@@ -2039,9 +2751,13 @@ def render_study():
             mean = f"<b>{highlight(w['meaning'], terms)}</b> {highlight(w['sound'], terms)}"
             body = f"<details><summary>보기</summary>{mean}</details>" if hide else mean
             g = f"<div class='g'>{esc(w['group'])}</div>" if w.get("group") else ""
-            cards.append(f"<div class='wcard'><div class='h'>{highlight(w['hanja'], terms)}</div><div class='m'>{body}</div>{g}</div>")
+            star = "<span class='star'>★</span>" if is_star(w["hanja"]) else ""
+            nt = note_of(w["hanja"])
+            note_html = f"<div class='note' title='{esc(nt)}'>📝 {esc(nt)}</div>" if nt else ""
+            cards.append(f"<div class='wcard'>{star}<div class='h'>{highlight(w['hanja'], terms)}</div><div class='m'>{body}</div>{g}{note_html}</div>")
         html("<div class='wgrid'>" + "".join(cards) + "</div>")
     st.divider()
+    render_set_tools()
     render_sheet()
 
 
@@ -2224,7 +2940,7 @@ def sidebar():
     grading_sidebar()
 
     with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
-        st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록)")
+        st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록·메모·사자성어·모의고사 기록·플랜 설정)")
         st.download_button("💾 저장", progress_json(), "hanja_progress.json", "application/json", width="stretch",
                            key="backup_side")
         pf = st.file_uploader("불러오기", type=["json"], key="progress_file")
@@ -2253,7 +2969,7 @@ def sidebar():
         st.caption("화면이 이상하게 동작하면 주소 끝에 ?nostore=1 을 붙여 접속해 보세요. (자동 저장 없이 실행)")
         st.divider()
         st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
-        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
+        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습·시험 기록 삭제)", key="confirm_reset")
         st.button("🗑️ 전체 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
 
 
@@ -2274,17 +2990,1349 @@ def run_app():
         s.flash = ""
     if not HAS_CANVAS:
         st.warning("한자 쓰기 기능을 불러오지 못해 지금은 손글씨 문제를 풀 수 없어요. 왼쪽 메뉴의 '진단 정보'를 확인해 주세요.")
-    t1, t2, t3, t4, t5 = st.tabs(["✏️ 연습", "🃏 카드", "📕 오답 노트", "📊 기록", "📚 단어장"])
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(
+        ["✏️ 연습", "🃏 카드", "💯 시험", "📜 사자성어", "📕 오답", "📊 기록", "📚 단어장"])
     with t1:
         render_practice()
     with t2:
         render_cards()
     with t3:
-        render_wrong()
+        render_exam()
     with t4:
-        render_stats()
+        render_idioms()
     with t5:
+        render_wrong()
+    with t6:
+        render_stats()
+    with t7:
         render_study()
+
+
+# ----------------------------------------------------------------------
+# 사자성어 (관리 · 시험 · 오답 노트) — 한자 통계와 섞지 않고 따로 저장해요
+# ----------------------------------------------------------------------
+def check_idiom_reading(user, it):
+    """독음 채점: 띄어쓰기·'/' 등은 무시하고, '/'로 이은 여러 답 중 하나면 정답"""
+    u = norm(user)
+    return bool(u) and (u in split_alts(it["sound"]) or u == norm(it["sound"]))
+
+
+def blank_text(h, bi):
+    return h[:bi] + "□" + h[bi + 1:]
+
+
+def masked_sound(it, bi):
+    """독음에서도 같은 자리를 가려요 (글자 수가 맞을 때만)"""
+    snd = re.sub(r"\s+", "", it["sound"])
+    if len(snd) != len(it["hanja"]):
+        return ""
+    return snd[:bi] + "□" + snd[bi + 1:]
+
+
+def idiom_char_pool():
+    """빈칸 문제의 오답 글자 후보: 단어장 한자 + 사자성어 속 한자"""
+    s = st.session_state
+    pool = set()
+    for w in s.words:
+        pool.update(c for c in w["hanja"] if has_hanja(c))
+    for x in s.idioms:
+        pool.update(x["hanja"])
+    return pool
+
+
+def idiom_choices(it, field, n=4, avoid_sound=False):
+    """보기 만들기: 같은 분류·같은 글자 수의 다른 사자성어를 먼저 오답 보기로 써요"""
+    s = st.session_state
+    key = (lambda x: norm(x["meaning"])) if field == "meaning" else (lambda x: x["hanja"])
+    others = [x for x in s.idioms if x["hanja"] != it["hanja"]]
+    if avoid_sound:  # 독음이 같은 다른 사자성어는 정답 시비가 생겨서 제외
+        others = [x for x in others if norm(x["sound"]) != norm(it["sound"])]
+    random.shuffle(others)
+    grp, ln = it.get("group"), len(it["hanja"])
+    others.sort(key=lambda x: (0 if grp and x.get("group") == grp else 1, 0 if len(x["hanja"]) == ln else 1))
+    seen, pick = {key(it)}, []
+    for x in others:
+        if key(x) in seen:
+            continue
+        seen.add(key(x))
+        pick.append(x)
+        if len(pick) == n - 1:
+            break
+    opts = pick + [it]
+    random.shuffle(opts)
+    return [{"key": x["hanja"], "text": x[field]} for x in opts]
+
+
+def blank_choices(it, bi, cpool=None, n=4):
+    ans = it["hanja"][bi]
+    pool = sorted((cpool if cpool is not None else idiom_char_pool()) - set(it["hanja"]))
+    random.shuffle(pool)
+    opts = pool[: n - 1] + [ans]
+    random.shuffle(opts)
+    return [{"key": c, "text": c} for c in opts]
+
+
+def make_idiom_item(it, ty, cpool=None):
+    it = dict(it)
+    q = {"it": it, "type": ty}
+    if ty == "i_ch_snd":
+        q["opts"] = idiom_choices(it, "hanja", avoid_sound=True)
+    elif ty == "i_ch_hj":
+        q["opts"] = idiom_choices(it, "hanja")
+    elif ty == "i_ch_ko":
+        q["opts"] = idiom_choices(it, "meaning")
+    elif ty in ("i_blank", "i_hw"):
+        q["bi"] = random.randrange(len(it["hanja"]))
+        if ty == "i_blank":
+            q["opts"] = blank_choices(it, q["bi"], cpool)
+    if "opts" in q and len(q["opts"]) < 2:  # 보기를 못 만들면 독음 쓰기로 대신
+        q = {"it": it, "type": "i_read"}
+    return q
+
+
+def idiom_kinds_avail():
+    """(고르기 가능, 빈칸 고르기 가능, 빈칸 손글씨 가능)"""
+    n = len(st.session_state.idioms)
+    choice_ok = n >= 4
+    blank_ok = choice_ok and len(idiom_char_pool()) >= 10
+    hw_ok = bool(HAS_CANVAS and find_font())
+    return choice_ok, blank_ok, hw_ok
+
+
+def idiom_types_for(kind, avail=None):
+    choice_ok, blank_ok, hw_ok = avail or idiom_kinds_avail()
+    ok = {"i_read": True, "i_ch_snd": choice_ok, "i_ch_ko": choice_ok, "i_ch_hj": choice_ok,
+          "i_blank": blank_ok, "i_hw": hw_ok}
+    if kind == "섞어서":
+        return [t for t in IDIOM_LABELS if ok[t]]
+    return [t for t in IDIOM_KIND_TYPES.get(kind, []) if ok[t]]
+
+
+def idiom_q_text(q):
+    it, ty = q["it"], q["type"]
+    if ty in ("i_read", "i_ch_ko"):
+        return it["hanja"]
+    if ty == "i_ch_snd":
+        return it["sound"]
+    if ty == "i_ch_hj":
+        return it["meaning"]
+    return blank_text(it["hanja"], q["bi"])
+
+
+def idiom_a_text(q):
+    it, ty = q["it"], q["type"]
+    table = {"i_read": it["sound"], "i_ch_snd": it["hanja"], "i_ch_ko": it["meaning"], "i_ch_hj": it["hanja"]}
+    return table.get(ty) or it["hanja"][q["bi"]]
+
+
+def record_idiom(q, ok, ans, retry=False):
+    """사자성어 풀이 기록 (한자 통계와 따로 idiom_stats / idiom_wrong 에 저장)"""
+    s = st.session_state
+    it = q["it"]
+    key = it["hanja"]
+    e = s.idiom_stats.setdefault(key, {"sound": it["sound"], "meaning": it["meaning"], "right": 0, "wrong": 0})
+    if ok:
+        e["right"] += 1
+        if retry and key in s.idiom_wrong:
+            del s.idiom_wrong[key]
+    else:
+        e["wrong"] += 1
+        w = s.idiom_wrong.setdefault(
+            key, {"hanja": key, "sound": it["sound"], "meaning": it["meaning"], "wrong_count": 0, "last": ""})
+        w["wrong_count"] += 1
+        w["last"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    return {"q": q, "correct": bool(ok), "answer": str(ans)}
+
+
+def record_external(w, qtype, ok, ans, retry=False):
+    """기존 record()를 재사용하되, 연습 중인 퀴즈의 결과 목록(s.results)은 건드리지 않게 감싸요 (모의고사용)"""
+    s = st.session_state
+    keep, keep_retry = s.results, s.retry_mode
+    s.results, s.retry_mode = [], bool(retry)
+    try:
+        record(w, qtype, ok, ans)
+    finally:
+        s.results, s.retry_mode = keep, keep_retry
+
+
+# --- 손글씨 공통 (모의고사·사자성어 빈칸용; 연습 탭의 render_write는 그대로 둬요) -------
+def canvas_backdrop_for(box_key, img, px):
+    """canvas_backdrop 과 같지만 칸 이름(box_key)을 따로 받아서, 여러 화면의 캔버스가 서로 겹치지 않게 해요"""
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    html(
+        f"<style>.st-key-{box_key}{{width:{px + 52}px; max-width:100%; background:url(" + uri + ") 0 0 / "
+        f"{px}px {px}px no-repeat;}}"
+        f".st-key-{box_key} iframe{{mix-blend-mode:multiply;}}</style>"
+    )
+
+
+def hw_candidates():
+    s = st.session_state
+    chars = [w["hanja"] for w in s.words if len(w["hanja"]) == 1]
+    for x in s.idioms:
+        chars.extend(x["hanja"])
+    return list(dict.fromkeys(chars))[:800]
+
+
+def hw_grade(res, ch, font, cands):
+    """캔버스 결과를 기존 grade_writing 으로 조용히 채점 -> (맞았나, 표시용 답)"""
+    data = None
+    if res is not None and getattr(res, "image_data", None) is not None:
+        data = flatten(res.image_data)
+    if data is None or (data[:, :, :3].astype(float).mean(axis=2) < 110).sum() < 30:
+        return False, "(빈칸)"
+    if not font:
+        return False, "(채점 불가)"
+    r = grade_writing(data, ch, font, grade_params(), cands)
+    if r is None:
+        return False, "(인식 못함)"
+    return bool(r["ok"]), f"유사도 {r['score']:.2f}"
+
+
+def hw_clear():
+    st.session_state.hw_clear += 1
+
+
+# --- 문제 그리기 (사자성어 시험 · 모의고사 공용) -------------------------------------
+def idiom_card(text):
+    n = max(1, len(text))
+    size = 64 if n <= 4 else 50 if n <= 6 else 40
+    html(f"<div class='hj-card wide' style='font-size:min({size}px,{int(80 / n)}vw)'>{esc(text)}</div>")
+
+
+def _idiom_pick(q, o, answer_fn):
+    it, ty = q["it"], q["type"]
+    right = it["hanja"][q["bi"]] if ty == "i_blank" else it["hanja"]
+    answer_fn(o["key"] == right, o["text"])
+
+
+def _idiom_skip(answer_fn):
+    answer_fn(False, "(모르겠어요)")
+
+
+def render_idiom_q(q, scope, answer_fn, pos, nonce):
+    """사자성어 문제 한 개. 맞고 틀림은 answer_fn(ok, 내 답)으로 넘기고, 정답은 보여주지 않아요"""
+    s = st.session_state
+    it, ty = q["it"], q["type"]
+    base = f"{scope}_{pos}_{nonce}"
+    if ty == "i_read":
+        idiom_card(it["hanja"])
+        html("<div class='ask'>이 사자성어의 <b>독음</b>을 입력하세요. 예) 일석이조</div>")
+        with st.form(f"if_{base}", border=False):
+            ans = st.text_input("독음", key=f"ia_{base}", label_visibility="collapsed", placeholder="독음")
+            c1, c2 = st.columns(2)
+            go = c1.form_submit_button("다음 ➡️", type="primary", width="stretch")
+            skip = c2.form_submit_button("모르겠어요", width="stretch")
+        if go or skip:
+            a = (ans or "").strip() if go else ""
+            answer_fn(check_idiom_reading(a, it), a or ("(빈칸)" if go else "(모르겠어요)"))
+            st.rerun()
+        return
+    if ty in ("i_blank", "i_hw"):
+        bi = q["bi"]
+        ms = masked_sound(it, bi)
+        clue = f"뜻: {esc(it['meaning'])}" + (f" · 독음: {esc(ms)}" if ms else "")
+    if ty == "i_hw":
+        px, font = canvas_px(), find_font()
+        left, right = st.columns(2)
+        with left:
+            idiom_card(blank_text(it["hanja"], bi))
+            html(f"<div class='ask'>{clue}<br>□에 들어갈 한자를 오른쪽 칸에 쓰세요</div>")
+        canvas_backdrop_for(f"canvas_box_{scope}", grid_image(px), px)
+        with right:
+            with st.container(key=f"canvas_box_{scope}"):
+                res = draw_canvas(f"icv_{base}_{s.hw_clear}_{px}", px)
+        b1, b2, b3 = st.columns(3)
+        if b1.button("다음 ➡️", key=f"ih_go_{base}", type="primary", width="stretch"):
+            ok, shown = hw_grade(res, it["hanja"][bi], font, hw_candidates())
+            answer_fn(ok, shown)
+            st.rerun()
+        b2.button("지우기", key=f"ih_clr_{base}", on_click=hw_clear, width="stretch")
+        b3.button("모르겠어요", key=f"ih_skip_{base}", on_click=_idiom_skip, args=(answer_fn,), width="stretch")
+        return
+    # 고르기 유형
+    if ty == "i_ch_snd":
+        html(f"<div class='mean-card'><b>{esc(it['sound'])}</b></div>")
+        html("<div class='ask'>이 독음에 해당하는 <b>사자성어</b>는?</div>")
+        cls = "hj"
+    elif ty == "i_ch_ko":
+        idiom_card(it["hanja"])
+        html("<div class='ask'>이 사자성어의 <b>뜻</b>은?</div>")
+        cls = "text"
+    elif ty == "i_ch_hj":
+        html(f"<div class='mean-card' style='font-size:1.25rem'>{esc(it['meaning'])}</div>")
+        html("<div class='ask'>이 뜻에 해당하는 <b>사자성어</b>는?</div>")
+        cls = "hj"
+    else:  # i_blank
+        idiom_card(blank_text(it["hanja"], bi))
+        html(f"<div class='ask'>{clue}<br>□에 들어갈 <b>한자</b>는?</div>")
+        cls = "blank"
+    wide = cls == "text" or (cls == "hj" and max(len(o["text"]) for o in q["opts"]) > 5)
+    with st.container(key=f"xc_{cls}_{scope}"):
+        cols = st.columns(1 if wide else 2)
+        for i, o in enumerate(q["opts"]):
+            cols[i % len(cols)].button(o["text"], key=f"io_{base}_{i}", on_click=_idiom_pick,
+                                       args=(q, o, answer_fn), width="stretch")
+    st.button("모르겠어요", key=f"is_{base}", on_click=_idiom_skip, args=(answer_fn,))
+
+
+# --- 사자성어 시험 ---------------------------------------------------------------------
+def idiom_pool_for(src, groups):
+    s = st.session_state
+    if src == "오답 노트만":
+        return [{"hanja": v["hanja"], "sound": v["sound"], "meaning": v["meaning"], "group": ""}
+                for v in s.idiom_wrong.values() if v.get("sound") and v.get("meaning")]
+    return [dict(x) for x in s.idioms if not (src == "분류 선택" and groups) or x.get("group") in groups]
+
+
+def start_idiom_quiz():
+    s = st.session_state
+    src, kind = s.get("idm_src", "전체"), s.get("idm_type", "섞어서")
+    pool = idiom_pool_for(src, s.get("idm_groups", []))
+    if not pool:
+        s.flash = ("오답 노트에 사자성어가 없어요. 🎉" if src == "오답 노트만"
+                   else "문제로 만들 사자성어가 없어요. '관리'에서 먼저 추가해 주세요.")
+        return
+    types = idiom_types_for(kind)
+    if not types:
+        s.flash = "고른 유형으로는 문제를 만들 수 없어요. (고르기는 사자성어가 4개 이상, 손글씨는 캔버스·폰트가 필요해요)"
+        return
+    random.shuffle(pool)
+    cpool = idiom_char_pool()
+    count = _int(s.get("idm_count"), 10, 1, 100)
+    items = [make_idiom_item(it, random.choice(types), cpool) for it in pool[:count]]
+    reset_idiom_quiz()
+    s.iquiz, s.iretry, s.flash = items, (src == "오답 노트만"), ""
+
+
+def idiom_answer(ok, shown):
+    s = st.session_state
+    if s.ipos >= len(s.iquiz):
+        return
+    q = s.iquiz[s.ipos]
+    s.ires.append(record_idiom(q, ok, shown, retry=s.iretry))
+    s.ipos += 1
+    s.inonce += 1
+
+
+def idiom_retry_wrong():
+    s = st.session_state
+    items = [make_idiom_item(r["q"]["it"], r["q"]["type"]) for r in s.ires if not r["correct"]]
+    if items:
+        reset_idiom_quiz()
+        s.iquiz, s.iretry = items, False
+
+
+def go_idiom_manage():
+    st.session_state.idm_view = "관리"
+
+
+def render_idiom_setup():
+    s = st.session_state
+    n = len(s.idioms)
+    st.subheader("사자성어 시험")
+    st.caption(f"사자성어 {n}개 · 한자 시험과 따로 기록해요. 정답은 끝난 뒤에 보여줘요.")
+    av = idiom_kinds_avail()
+    kinds = [k for k in IDIOM_KINDS if idiom_types_for(k, av)]
+    if n < 4:
+        st.info("사자성어가 4개 미만이라 '고르기·빈칸' 유형은 쓸 수 없어요. 4개 이상 담으면 열려요. (지금은 독음 쓰기만 가능해요)")
+    elif "빈칸 손글씨" not in kinds:
+        st.caption("'빈칸 손글씨'는 손글씨 기능과 한자 폰트가 있어야 해요. (지금은 빠져 있어요)")
+    if s.get("idm_type") not in kinds:
+        s.idm_type = kinds[0]
+    st.radio("유형", kinds, key="idm_type", horizontal=True)
+    if s.get("idm_src") not in IDIOM_SRC:
+        s.idm_src = IDIOM_SRC[0]
+    st.radio("범위", IDIOM_SRC, key="idm_src", horizontal=True)
+    if s.idm_src == "분류 선택":
+        groups = sorted({x["group"] for x in s.idioms if x.get("group")})
+        if groups:
+            s.idm_groups = [g for g in s.get("idm_groups", []) if g in groups]
+            st.multiselect("분류 (비워 두면 전체)", groups, key="idm_groups", placeholder="전체 (눌러서 고르기)")
+        else:
+            st.caption("분류가 적힌 사자성어가 없어서 전체에서 나와요.")
+    st.slider("문제 수", 5, 50, step=5, key="idm_count")
+    st.button("▶️ 시작하기", type="primary", on_click=start_idiom_quiz, width="stretch", key="idm_start")
+
+
+def render_idiom_result():
+    s = st.session_state
+    res = s.ires
+    n = len(res)
+    c = sum(r["correct"] for r in res)
+    st.subheader("시험 결과예요")
+    rate = c / n * 100 if n else 0
+    html(f"<div class='score-box'><div class='big'>{c} / {n}</div>"
+         f"<div class='lbl'>정답률 {rate:.0f}% · 틀린 것은 사자성어 오답 노트에 담았어요</div></div>")
+    wrong = [r for r in res if not r["correct"]]
+    if wrong:
+        st.markdown("##### 틀린 문제")
+        st.dataframe(pd.DataFrame([{
+            "유형": IDIOM_LABELS[r["q"]["type"]], "문제": idiom_q_text(r["q"]), "내 답": r["answer"],
+            "정답": idiom_a_text(r["q"]), "사자성어": r["q"]["it"]["hanja"], "독음": r["q"]["it"]["sound"],
+            "뜻": r["q"]["it"]["meaning"]} for r in wrong]), width="stretch", hide_index=True)
+    elif n:
+        st.success("전부 맞혔어요! 🎉")
+    b1, b2 = st.columns(2)
+    b1.button("🔁 새로 시작", on_click=start_idiom_quiz, width="stretch", key="idm_again")
+    if wrong:
+        b2.button("❌ 틀린 것만 다시", on_click=idiom_retry_wrong, width="stretch", key="idm_wrong_again")
+    st.button("설정 바꾸기", on_click=reset_idiom_quiz, key="idm_back")
+
+
+def render_idiom_exam():
+    s = st.session_state
+    if not s.idioms:
+        st.info("아직 사자성어가 없어요. '관리'에서 추가하거나 내장 세트를 불러와 주세요.")
+        st.button("🛠 관리로 가기", on_click=go_idiom_manage, key="idm_go_manage")
+        return
+    if not s.iquiz:
+        render_idiom_setup()
+        return
+    if s.ipos >= len(s.iquiz):
+        render_idiom_result()
+        return
+    q = s.iquiz[s.ipos]
+    st.progress(s.ipos / len(s.iquiz), text=f"{s.ipos + 1} / {len(s.iquiz)}  ·  {IDIOM_LABELS[q['type']]}")
+    render_idiom_q(q, "idm", idiom_answer, s.ipos, s.inonce)
+    st.button("그만하기", key="idm_quit", on_click=reset_idiom_quiz)
+
+
+# --- 사자성어 오답 노트 -----------------------------------------------------------------
+def idiom_wrong_delete():
+    s = st.session_state
+    for k in s.get("idm_wrong_sel", []):
+        s.idiom_wrong.pop(k, None)
+    s.idm_wrong_sel = []
+
+
+def idiom_wrong_clear():
+    st.session_state.idiom_wrong.clear()
+
+
+def go_idiom_wrong_quiz():
+    s = st.session_state
+    s.idm_src, s.idm_type, s.idm_view = "오답 노트만", "섞어서", "시험"
+    start_idiom_quiz()
+
+
+def render_idiom_wrong():
+    s = st.session_state
+    if not s.idiom_wrong:
+        st.info("사자성어 오답 노트가 비어 있어요. 틀린 사자성어가 여기에 쌓여요.")
+        return
+    df = pd.DataFrame([{"사자성어": v["hanja"], "독음": v["sound"], "뜻": v["meaning"],
+                        "틀린 횟수": v["wrong_count"], "최근": v["last"]} for v in s.idiom_wrong.values()]
+                      ).sort_values("틀린 횟수", ascending=False)
+    st.dataframe(df, width="stretch", hide_index=True)
+    s.idm_wrong_sel = [x for x in s.get("idm_wrong_sel", []) if x in s.idiom_wrong]
+    st.multiselect("오답 노트에서 뺄 사자성어", list(s.idiom_wrong.keys()), key="idm_wrong_sel")
+    c1, c2, c3 = st.columns(3)
+    c1.button("선택 삭제", on_click=idiom_wrong_delete, width="stretch", key="idm_wrong_del")
+    c2.button("전체 비우기", on_click=idiom_wrong_clear, width="stretch", key="idm_wrong_all")
+    c3.download_button("CSV로 저장", df.to_csv(index=False).encode("utf-8-sig"), "사자성어_오답노트.csv",
+                       "text/csv", width="stretch", key="idm_wrong_csv")
+    st.button("📝 오답으로 바로 시험 보기", type="primary", on_click=go_idiom_wrong_quiz, width="stretch",
+              key="idm_wrong_quiz")
+    st.caption("오답 노트 범위에서 맞히면 노트에서 자동으로 빠져요.")
+
+
+# --- 사자성어 관리 ---------------------------------------------------------------------
+IDIOM_COLS = ["사자성어", "독음", "뜻", "분류"]
+
+
+def idioms_df(lst):
+    return pd.DataFrame([{"사자성어": x["hanja"], "독음": x["sound"], "뜻": x["meaning"], "분류": x.get("group", "")}
+                         for x in lst], columns=IDIOM_COLS)
+
+
+def idioms_csv(lst):
+    return idioms_df(lst).to_csv(index=False).encode("utf-8-sig")
+
+
+def idioms_from_df(df):
+    out, errors, seen = [], [], {}
+    for i, (_, r) in enumerate(df.iterrows(), 1):
+        h = re.sub(r"\s+", "", _cell(r.get("사자성어")))
+        sd, mn, g = _cell(r.get("독음")), _cell(r.get("뜻")), _cell(r.get("분류"))
+        if not (h or sd or mn or g):
+            continue
+        why = idiom_problem(h, sd, mn)
+        if why:
+            errors.append(f"{i}번째 줄 ({h or '한자 없음'}): {why}")
+            continue
+        if h in seen:
+            errors.append(f"{i}번째 줄 ({h}): {seen[h]}번째 줄과 같은 사자성어예요")
+            continue
+        seen[h] = i
+        out.append({"hanja": h, "sound": sd, "meaning": mn, "group": g[:30]})
+    if len(out) > MAX_IDIOMS:
+        errors.append(f"사자성어는 최대 {MAX_IDIOMS}개까지만 저장해요 (지금 {len(out)}개)")
+    return out, errors
+
+
+def add_idioms(items):
+    """새 사자성어 합치기 (이미 있는 것은 먼저 있던 걸 유지). 반환: (새로 담은 수, 겹친 수, 뜻·음이 달라 유지한 것들)"""
+    s = st.session_state
+    merged, added, dup, conf = merge_items(s.idioms, items, ("meaning", "sound"))
+    if len(merged) > MAX_IDIOMS:
+        merged = merged[:MAX_IDIOMS]
+    s.idioms = merged
+    reset_idiom_quiz()
+    s.ied_ver += 1
+    return added, dup, conf
+
+
+def _report_add(items, probs, dup_in):
+    """붙여넣기·파일로 가져온 결과를 합치고 안내 문구를 만들어요 (콜백/버튼 공용)"""
+    s = st.session_state
+    notes = []
+    if items:
+        added, dup, conf = add_idioms(items)
+        msg = f"사자성어 {added}개를 담았어요."
+        if dup + dup_in:
+            msg += f" (겹쳐서 건너뜀 {dup + dup_in}개)"
+        if conf:
+            notes.append(f"같은 사자성어인데 독음·뜻이 달라서 먼저 있던 것을 유지한 항목 {len(conf)}개: " + ", ".join(conf[:10]))
+        s.flash = msg
+    else:
+        s.flash = "담을 수 있는 사자성어가 없었어요."
+    if probs:
+        notes.append(f"제외한 줄 {len(probs)}개:\n" + "\n".join(f"- {p}" for p in probs[:8])
+                     + (f"\n- … 외 {len(probs) - 8}건" if len(probs) > 8 else ""))
+    s.notice = {"kind": "idiom", "msgs": notes} if notes else None
+
+
+def import_idiom_paste():
+    s = st.session_state
+    ver = s.ied_ver
+    text, grp = s.get(f"idp_t_{ver}", ""), s.get(f"idp_g_{ver}", "")
+    items, probs, dup = build_idioms(parse_idiom_text(text or "", (grp or "").strip()[:30]))
+    _report_add(items, probs, dup)
+
+
+def import_idiom_file():
+    s = st.session_state
+    f = s.get(f"idiom_file_{s.ied_ver}")
+    if f is None:
+        s.flash = "먼저 파일을 골라 주세요."
+        return
+    if f.size > MAX_SET_BYTES * 5:
+        s.flash = "파일이 너무 커요 (10MB 이하)."
+        return
+    try:
+        rows = parse_idiom_file(f)
+    except Exception as e:
+        s.flash = f"파일을 읽지 못했어요: {e}"
+        return
+    items, probs, dup = build_idioms(rows)
+    _report_add(items, probs, dup)
+
+
+def commit_idioms(new):
+    """표 편집 결과 저장. 독음·뜻을 고치면 오답 노트·통계의 복사본도 같이 바꿔요 (한자를 바꾸면 삭제 + 새 항목)"""
+    s = st.session_state
+    old = {x["hanja"]: x for x in s.idioms}
+    keys = {x["hanja"] for x in new}
+    changed = 0
+    for x in new:
+        o = old.get(x["hanja"])
+        if o and (o["sound"] != x["sound"] or o["meaning"] != x["meaning"]):
+            changed += 1
+            for book in (s.idiom_wrong, s.idiom_stats):
+                e = book.get(x["hanja"])
+                if e:
+                    e["sound"], e["meaning"] = x["sound"], x["meaning"]
+    added = sum(1 for x in new if x["hanja"] not in old)
+    removed = sum(1 for h in old if h not in keys)
+    s.idioms = new
+    reset_idiom_quiz()
+    s.ied_ver += 1
+    s.flash = f"사자성어를 저장했어요. (추가 {added} · 수정 {changed} · 삭제 {removed})"
+
+
+def idiom_confirm(kind):
+    st.session_state.idm_confirm = kind
+
+
+def idiom_delete_do():
+    s = st.session_state
+    if s.get("idm_confirm") == "all":
+        n = len(s.idioms)
+        s.idioms = []
+    else:
+        sel = set(s.get("idm_del", []))
+        n = len(sel)
+        s.idioms = [x for x in s.idioms if x["hanja"] not in sel]
+    s.idm_del, s.idm_confirm = [], ""
+    reset_idiom_quiz()
+    s.ied_ver += 1
+    s.flash = f"사자성어 {n}개를 지웠어요. (풀이 기록은 남겨 뒀어요)"
+
+
+def render_idiom_manage():
+    s = st.session_state
+    ver = s.ied_ver
+    show_notice("idiom", "idm_top")
+    st.caption(f"사자성어 {len(s.idioms)}개 (최대 {MAX_IDIOMS}개) · 한 사자성어는 한자 {IDIOM_MIN}~{IDIOM_MAX}자, 독음·뜻은 꼭 있어야 해요.")
+    with st.expander("📂 내장 사자성어 불러오기"):
+        set_picker("idiom", "idiom", show=False)
+    with st.expander("➕ 한 개 추가"):
+        with st.form("idm_add_form", border=False):
+            c1, c2 = st.columns(2)
+            h = c1.text_input("사자성어 (한자)", key=f"ida_h_{ver}")
+            sd = c2.text_input("독음", key=f"ida_s_{ver}")
+            m = st.text_input("뜻", key=f"ida_m_{ver}")
+            g = st.text_input("분류 (선택)", key=f"ida_g_{ver}")
+            add = st.form_submit_button("➕ 사자성어 추가", type="primary", width="stretch")
+        if add:
+            h, sd, m, g = re.sub(r"\s+", "", h or ""), (sd or "").strip(), (m or "").strip(), (g or "").strip()[:30]
+            why = idiom_problem(h, sd, m)
+            if not why and any(x["hanja"] == h for x in s.idioms):
+                why = "이미 있는 사자성어예요. '표로 고치기'에서 수정해 주세요."
+            if not why and len(s.idioms) >= MAX_IDIOMS:
+                why = f"사자성어는 최대 {MAX_IDIOMS}개까지만 담아요."
+            if why:
+                st.warning(why)
+            else:
+                add_idioms([{"hanja": h, "sound": sd, "meaning": m, "group": g}])
+                s.flash = f"'{h}'을(를) 추가했어요."
+                st.rerun()
+    with st.expander("📋 여러 줄 붙여넣기"):
+        with st.form("idm_paste_form", border=False):
+            st.text_area("한 줄에 하나씩 (한자 독음 뜻)", height=150, key=f"idp_t_{ver}",
+                         placeholder="一石二鳥 일석이조 한 가지 일로 두 가지 이익을 얻음")
+            st.text_input("분류 (선택, 붙여넣은 줄 전부에 같이 적어요)", key=f"idp_g_{ver}")
+            st.form_submit_button("📋 붙여넣은 줄 추가", type="primary", on_click=import_idiom_paste, width="stretch")
+        st.caption("공백으로 나눠도 되고, 탭·'|'·';'·쉼표(한자,독음,뜻)로 나눠도 돼요. '#'으로 시작하는 줄은 무시해요.")
+    with st.expander("📤 CSV 올리기 · 받기"):
+        st.file_uploader("사자성어 파일 (csv / xlsx / txt)", key=f"idiom_file_{ver}")  # 형식 제한 없음: 태블릿 호환
+        st.button("📤 올린 파일 불러오기 (지금 목록에 합치기)", on_click=import_idiom_file, width="stretch", key="idm_import")
+        st.caption("열: 사자성어, 독음, 뜻, 분류(선택). 첫 줄은 제목 줄이어도 돼요.")
+        st.download_button("📥 현재 사자성어 CSV 받기", idioms_csv(s.idioms), "내_사자성어.csv", "text/csv",
+                           width="stretch", key="idm_csv_dl")
+        st.caption("받은 파일을 GitHub 저장소의 idioms/ 폴더에 올리면 '내장 사자성어'가 돼요. 파일 이름이 세트 이름이에요.")
+    with st.expander("✏️ 표로 고치기 · 삭제"):
+        if s.idioms:
+            with st.form("idm_edit_form", border=False):
+                edited = st.data_editor(
+                    idioms_df(s.idioms), num_rows="dynamic", hide_index=True, key=f"idm_editor_{ver}",
+                    column_config={
+                        "사자성어": st.column_config.TextColumn("사자성어", max_chars=IDIOM_MAX),
+                        "독음": st.column_config.TextColumn("독음", max_chars=60),
+                        "뜻": st.column_config.TextColumn("뜻", max_chars=300),
+                        "분류": st.column_config.TextColumn("분류", max_chars=30),
+                    })
+                saved = st.form_submit_button("💾 사자성어 저장", type="primary", width="stretch")
+            if saved:
+                new, errs = idioms_from_df(edited)
+                if errs:
+                    st.error("저장하지 못했어요. 아래를 고친 뒤 다시 눌러 주세요.\n\n"
+                             + "\n".join(f"- {e}" for e in errs[:8])
+                             + (f"\n- … 외 {len(errs) - 8}건" if len(errs) > 8 else ""))
+                elif new == s.idioms:
+                    st.info("바뀐 내용이 없어요.")
+                else:
+                    commit_idioms(new)
+                    st.rerun()
+            st.markdown("**골라서 삭제**")
+            keys = [x["hanja"] for x in s.idioms]
+            snd = {x["hanja"]: x["sound"] for x in s.idioms}
+            s.idm_del = [x for x in s.get("idm_del", []) if x in snd]
+            st.multiselect("지울 사자성어", keys, key="idm_del", format_func=lambda k: f"{k} {snd.get(k, '')}",
+                           placeholder="여러 개 고르기")
+            if s.get("idm_confirm"):
+                n = len(s.idioms) if s.idm_confirm == "all" else len(s.idm_del)
+                st.warning(f"정말 {n}개를 지울까요? 되돌릴 수 없어요.")
+                y, no = st.columns(2)
+                y.button("네, 지울게요", on_click=idiom_delete_do, width="stretch", key="idm_del_yes")
+                no.button("아니요", on_click=idiom_confirm, args=("",), width="stretch", key="idm_del_no")
+            else:
+                d1, d2 = st.columns(2)
+                d1.button("선택 삭제", on_click=idiom_confirm, args=("del",), disabled=not s.idm_del,
+                          width="stretch", key="idm_del_ask")
+                d2.button("전체 비우기", on_click=idiom_confirm, args=("all",), width="stretch", key="idm_all_ask")
+        else:
+            st.caption("아직 사자성어가 없어요. 위에서 추가하거나 불러와 주세요.")
+
+
+def render_idioms():
+    s = st.session_state
+    views = ["시험", "관리", "오답 노트"]
+    if s.get("idm_view") not in views:
+        s.idm_view = views[0]
+    st.radio("사자성어 화면", views, key="idm_view", horizontal=True, label_visibility="collapsed")
+    if s.idm_view == "관리":
+        render_idiom_manage()
+    elif s.idm_view == "오답 노트":
+        render_idiom_wrong()
+    else:
+        render_idiom_exam()
+
+
+# ----------------------------------------------------------------------
+# 모의고사 (100점 만점) — 정답은 끝난 뒤에 한꺼번에 보여줘요
+# ----------------------------------------------------------------------
+def exam_pool():
+    """모의고사 출제 범위에 해당하는 한자들"""
+    s = st.session_state
+    src = s.get("ex_src", "전체 단어")
+    if src == "오답 노트만":
+        return [{"hanja": v["hanja"], "meaning": v["meaning"], "sound": v["sound"], "group": ""}
+                for v in s.wrong.values() if v.get("sound")]
+    groups = s.get("ex_groups", []) if src == "분류 선택" else []
+    pool = [w for w in s.words if not groups or w.get("group") in groups]
+    if src == "별표 한자만":
+        pool = [w for w in pool if is_star(w["hanja"])]
+    return pool
+
+
+def exam_idiom_pool():
+    s = st.session_state
+    if s.get("ex_src") == "오답 노트만":
+        return idiom_pool_for("오답 노트만", [])
+    return [dict(x) for x in s.idioms]
+
+
+def exam_limits(pool):
+    """유형별로 지금 낼 수 있는 최대 문항 수 (0이면 막힌 유형)"""
+    s = st.session_state
+    font_ok = bool(HAS_CANVAS and find_font())
+    return {
+        "ko": len(pool),
+        "write": sum(1 for w in pool if len(w["hanja"]) == 1) if font_ok else 0,
+        "choice": len(pool) if len(s.words) >= 4 else 0,
+        "idiom": len(exam_idiom_pool()) if len(s.idioms) >= 4 else 0,
+    }
+
+
+def exam_blocked_reasons(lim, pool):
+    s = st.session_state
+    r = {}
+    if not pool:
+        r["ko"] = "고른 범위에 한자가 없어요"
+    if lim["write"] == 0:
+        r["write"] = ("손글씨 기능(캔버스)이나 한자 폰트가 없어요" if not (HAS_CANVAS and find_font())
+                      else "범위 안에 한 글자 한자가 없어요")
+    if lim["choice"] == 0:
+        r["choice"] = "단어장에 한자가 4개 이상 있고 범위 안에 한자가 있어야 해요"
+    if lim["idiom"] == 0:
+        r["idiom"] = (f"사자성어가 4개 이상 있어야 해요 (지금 {len(s.idioms)}개)" if len(s.idioms) < 4
+                      else "범위(오답 노트)에 사자성어가 없어요")
+    return r
+
+
+def exam_total(lim=None):
+    """(총 문항 수, 배점 합계) — 막힌 유형은 0문항으로 쳐요"""
+    s = st.session_state
+    lim = lim if lim is not None else exam_limits(exam_pool())
+    n_all, tot = 0, 0.0
+    for k in EXAM_ORDER:
+        n = 0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)
+        n_all += n
+        tot += n * _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0)
+    return n_all, round(tot, 2)
+
+
+def fit_points():
+    """배점을 비례해서 합계 100점으로 맞춰요 (소수 첫째 자리)"""
+    s = st.session_state
+    lim = exam_limits(exam_pool())
+    n = {k: (0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)) for k in EXAM_ORDER}
+    act = [k for k in EXAM_ORDER if n[k] > 0]
+    if not act:
+        return
+    pt = {k: _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0) for k in EXAM_ORDER}
+    total = sum(n[k] * pt[k] for k in act)
+    if total <= 0:
+        eq = 100.0 / sum(n[k] for k in act)
+        pt.update({k: eq for k in act})
+        total = 100.0
+    f = 100.0 / total
+    for k in act:
+        pt[k] = round(min(100.0, pt[k] * f), 1)
+    resid = round(100.0 - sum(n[k] * pt[k] for k in act), 4)
+    if abs(resid) > 1e-6:  # 반올림으로 생긴 차이를 한 유형에서 딱 맞게 메울 수 있으면 메워요
+        for k in reversed(act):
+            fixed = round(pt[k] + resid / n[k], 1)
+            if 0 <= fixed <= 100 and abs(sum(n[j] * (fixed if j == k else pt[j]) for j in act) - 100.0) < 1e-6:
+                pt[k] = fixed
+                break
+    for k in act:
+        s[f"ex_pt_{k}"] = float(pt[k])
+    s.flash = "배점을 100점에 맞췄어요."
+
+
+def start_exam():
+    s = st.session_state
+    pool = exam_pool()
+    lim = exam_limits(pool)
+    want = {k: (0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)) for k in EXAM_ORDER}
+    pts = {k: _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0) for k in EXAM_ORDER}
+    if sum(want.values()) == 0:
+        s.flash = "문항이 0개예요. 문항 수를 정해 주세요."
+        return
+    random.shuffle(pool)
+    singles = [w for w in pool if len(w["hanja"]) == 1]
+    write_w = singles[: want["write"]]  # 같은 한자가 여러 유형에 겹쳐 나오지 않게 나눠 뽑아요
+    used = {w["hanja"] for w in write_w}
+    rest = [w for w in pool if w["hanja"] not in used]
+    ko_w, rest = rest[: want["ko"]], rest[want["ko"]:]
+    ch_w = rest[: want["choice"]]
+    items = [{"kind": "ko", "pts": pts["ko"], "q": {"w": w, "type": "read"}} for w in ko_w]
+    items += [{"kind": "write", "pts": pts["write"], "q": {"w": w, "type": "write"}} for w in write_w]
+    items += [{"kind": "choice", "pts": pts["choice"],
+               "q": make_item(w, random.choice(["choice_ko", "choice_hj"]))} for w in ch_w]
+    got = {"ko": len(ko_w), "write": len(write_w), "choice": len(ch_w), "idiom": 0}
+    if want["idiom"]:
+        ipool = exam_idiom_pool()
+        random.shuffle(ipool)
+        types = [t for t in idiom_types_for("섞어서") if t != "i_hw"]
+        cpool = idiom_char_pool()
+        picked = ipool[: want["idiom"]]
+        items += [{"kind": "idiom", "pts": pts["idiom"], "q": make_idiom_item(it, random.choice(types), cpool)}
+                  for it in picked]
+        got["idiom"] = len(picked)
+    if not items:
+        s.flash = "문제를 만들 수 없어요. 범위를 확인해 주세요."
+        return
+    short = [f"{EXAM_TYPES[k]} {want[k]}→{got[k]}문항" for k in EXAM_ORDER if want[k] and got[k] < want[k]]
+    s.exam = {"items": items, "pos": 0, "answers": [], "start": now_kst_str(), "t0": time.time(),
+              "apply": s.get("ex_apply", "반영해요") == "반영해요", "src": s.get("ex_src", "전체 단어")}
+    s.exam_result, s.ex_quit = None, False
+    s.ex_nonce += 1
+    s.flash = ("범위 안 한자가 모자라서 문항을 줄였어요: " + ", ".join(short)) if short else ""
+
+
+def exam_wrong_row(n, it, a):
+    k, q = it["kind"], it["q"]
+    if k == "idiom":
+        x = q["it"]
+        return {"번호": n, "유형": f"{EXAM_TYPES[k]} · {IDIOM_LABELS[q['type']]}", "문제": idiom_q_text(q),
+                "내 답": a["answer"], "정답": f"{idiom_a_text(q)}  ({x['hanja']} · {x['meaning']})", "내 메모": ""}
+    w, ty = q["w"], q["type"]
+    if k == "write" or ty == "choice_hj":
+        question, right = _label(w), w["hanja"]
+    else:
+        question, right = w["hanja"], _label(w)
+    return {"번호": n, "유형": EXAM_TYPES[k], "문제": question, "내 답": a["answer"], "정답": right,
+            "내 메모": note_of(w["hanja"])}
+
+
+def finish_exam():
+    """채점 결과를 정리해서 기록(s.exams)에 남기고, 옵션에 따라 오답 노트·복습 기록에 반영해요"""
+    s = st.session_state
+    ex = s.exam
+    if not ex:
+        return
+    secs = int(max(0, time.time() - ex["t0"]))
+    types = {k: {"score": 0.0, "max": 0.0, "n": 0, "right": 0} for k in EXAM_ORDER}
+    wrong = []
+    for n, (it, a) in enumerate(zip(ex["items"], ex["answers"]), 1):
+        t = types[it["kind"]]
+        t["max"] += it["pts"]
+        t["n"] += 1
+        if a["ok"]:
+            t["score"] += it["pts"]
+            t["right"] += 1
+        else:
+            wrong.append(exam_wrong_row(n, it, a))
+    types = {k: {"score": round(v["score"], 1), "max": round(v["max"], 1), "n": v["n"], "right": v["right"]}
+             for k, v in types.items() if v["n"]}
+    full = round(sum(v["max"] for v in types.values()), 1)
+    score = round(sum(v["score"] for v in types.values()), 1)
+    entry = {"start": ex["start"], "date": ex["start"][:10], "score": score, "full": full or 100.0,
+             "n": len(ex["items"]), "types": types, "secs": secs}
+    s.exams.append(entry)
+    s.exams = s.exams[-MAX_EXAMS:]
+    if ex["apply"]:
+        retry = ex.get("src") == "오답 노트만"
+        for it, a in zip(ex["items"], ex["answers"]):
+            q = it["q"]
+            if it["kind"] == "idiom":
+                record_idiom(q, a["ok"], a["answer"], retry=retry)
+            else:
+                record_external(q["w"], q["type"], a["ok"], a["answer"], retry=retry)
+    s.exam_result = {"entry": entry, "wrong": wrong, "applied": bool(ex["apply"]),
+                     "end": now_kst_str()}
+    s.exam, s.ex_quit = None, False
+
+
+def exam_answer(ok, shown):
+    s = st.session_state
+    ex = s.exam
+    if not ex or ex["pos"] >= len(ex["items"]):
+        return
+    ex["answers"].append({"ok": bool(ok), "answer": str(shown)})
+    ex["pos"] += 1
+    s.ex_nonce += 1
+    if ex["pos"] >= len(ex["items"]):
+        finish_exam()
+
+
+def exam_idiom_answer(ok, shown):
+    exam_answer(ok, shown)
+
+
+def exam_pick_choice(q, o):
+    w, ty = q["w"], q["type"]
+    if o is None:
+        exam_answer(False, "(모르겠어요)")
+        return
+    shown = o["hanja"] if ty == "choice_hj" else o["label"]
+    exam_answer(o["hanja"] == w["hanja"], shown)
+
+
+def exam_quit_ask():
+    st.session_state.ex_quit = True
+
+
+def exam_quit_cancel():
+    st.session_state.ex_quit = False
+
+
+def exam_quit():
+    s = st.session_state
+    s.exam, s.ex_quit = None, False
+    s.ex_nonce += 1
+    s.flash = "시험을 그만뒀어요. 기록에는 남기지 않았어요."
+
+
+def close_exam_result():
+    st.session_state.exam_result = None
+
+
+# --- 화면: 시험 보는 중 ---------------------------------------------------------------
+def render_exam_ko(q):
+    s = st.session_state
+    w = q["w"]
+    hanja_card(w["hanja"])
+    html("<div class='ask'>이 한자의 <b>뜻과 음</b>을 입력하세요. 예) 하늘 천</div>")
+    base = f"{s.exam['pos']}_{s.ex_nonce}"
+    with st.form(f"exf_{base}", border=False):
+        ans = st.text_input("답", key=f"exa_{base}", label_visibility="collapsed", placeholder="뜻과 음 (예: 하늘 천)")
+        c1, c2 = st.columns(2)
+        go = c1.form_submit_button("다음 문제 ➡️", type="primary", width="stretch")
+        skip = c2.form_submit_button("모르겠어요", width="stretch")
+    if go or skip:
+        a = (ans or "").strip() if go else ""
+        ok = check_reading(a, w)[0] if a else False
+        exam_answer(ok, a or ("(빈칸)" if go else "(모르겠어요)"))
+        st.rerun()
+
+
+def render_exam_write(q):
+    s = st.session_state
+    w = q["w"]
+    font, px = find_font(), canvas_px()
+    base = f"{s.exam['pos']}_{s.ex_nonce}"
+    left, right = st.columns(2)
+    with left:
+        meaning_card(w)
+        html("<div class='ask'>에 해당하는 한자를 오른쪽 칸에 쓰세요</div>")
+    canvas_backdrop_for("canvas_box_exam", grid_image(px), px)
+    with right:
+        with st.container(key="canvas_box_exam"):
+            res = draw_canvas(f"xcv_{base}_{s.hw_clear}_{px}", px)
+    b1, b2, b3 = st.columns(3)
+    if b1.button("다음 문제 ➡️", key=f"xw_go_{base}", type="primary", width="stretch"):
+        cands = [x["hanja"] for x in s.words if len(x["hanja"]) == 1]
+        ok, shown = hw_grade(res, w["hanja"], font, cands)
+        exam_answer(ok, shown)
+        st.rerun()
+    b2.button("지우기", key=f"xw_clr_{base}", on_click=hw_clear, width="stretch")
+    if b3.button("모르겠어요", key=f"xw_skip_{base}", width="stretch"):
+        exam_answer(False, "(모르겠어요)")
+        st.rerun()
+
+
+def render_exam_choice(q):
+    s = st.session_state
+    w, ty = q["w"], q["type"]
+    if ty == "choice_ko":
+        hanja_card(w["hanja"])
+        html("<div class='ask'>이 한자의 <b>뜻과 음</b>은?</div>")
+    else:
+        meaning_card(w)
+        html("<div class='ask'>이 뜻·음에 해당하는 <b>한자</b>는?</div>")
+    base = f"{s.exam['pos']}_{s.ex_nonce}"
+    with st.container(key="xc_text_exam" if ty == "choice_ko" else "xc_hj_exam"):
+        cols = st.columns(2)
+        for i, o in enumerate(q["opts"]):
+            text = o["label"] if ty == "choice_ko" else o["hanja"]
+            cols[i % 2].button(text, key=f"xo_{base}_{i}", on_click=exam_pick_choice, args=(q, o), width="stretch")
+    st.button("모르겠어요", key=f"xo_skip_{base}", on_click=exam_pick_choice, args=(q, None))
+
+
+def render_exam_run():
+    s = st.session_state
+    ex = s.exam
+    items, pos = ex["items"], ex["pos"]
+    it = items[pos]
+    st.progress(pos / len(items), text=f"{pos + 1} / {len(items)}  ·  {EXAM_TYPES[it['kind']]}  ·  {fmt_pts(it['pts'])}점")
+    if s.ex_quit:
+        st.warning("정말 그만둘까요? 지금까지 푼 답은 기록에 남지 않아요.")
+        c1, c2 = st.columns(2)
+        c1.button("네, 그만둘래요", key="ex_quit_yes", on_click=exam_quit, width="stretch")
+        c2.button("계속 풀게요", key="ex_quit_no", on_click=exam_quit_cancel, width="stretch", type="primary")
+        return
+    kind = it["kind"]
+    if kind == "ko":
+        render_exam_ko(it["q"])
+    elif kind == "write":
+        render_exam_write(it["q"])
+    elif kind == "choice":
+        render_exam_choice(it["q"])
+    else:
+        render_idiom_q(it["q"], "exm", exam_idiom_answer, pos, s.ex_nonce)
+    st.button("그만두기", key="ex_quit_btn", on_click=exam_quit_ask)
+
+
+# --- 화면: 기록 그래프 / 결과 -----------------------------------------------------------
+def exam_pct(e):
+    return round(e["score"] / e["full"] * 100, 1) if e.get("full") else 0.0
+
+
+def render_exam_history(limit=20):
+    s = st.session_state
+    if not s.exams:
+        st.caption("아직 본 모의고사가 없어요.")
+        return
+    last = s.exams[-limit:]
+    target = _int(s.get("set_target"), 90, 0, 100)
+    first = len(s.exams) - len(last) + 1
+    df = pd.DataFrame({"회차": list(range(first, first + len(last))),
+                       "내 점수": [exam_pct(e) for e in last], "목표 점수": [target] * len(last)})
+    st.line_chart(df, x="회차", y=["내 점수", "목표 점수"], color=["#2B3A67", "#B8372C"])
+    st.caption("점수는 100점 만점으로 환산한 값이에요. 빨간 선이 목표 점수예요.")
+    st.dataframe(pd.DataFrame([{"회차": first + i, "날짜": e["date"], "점수": f"{fmt_pts(e['score'])} / {fmt_pts(e['full'])}",
+                                "문항": e["n"], "걸린 시간": fmt_secs(e["secs"])} for i, e in enumerate(last)][::-1]),
+                 width="stretch", hide_index=True)
+
+
+def render_exam_result():
+    s = st.session_state
+    r = s.exam_result
+    e = r["entry"]
+    st.subheader("모의고사 결과예요")
+    html(f"<div class='score-box'><div class='big'>{fmt_pts(e['score'])} / {fmt_pts(e['full'])}점</div>"
+         f"<div class='lbl'>{e['n']}문항 · 걸린 시간 {fmt_secs(e['secs'])}</div></div>")
+    chips = []
+    if len(s.exams) >= 2:
+        diff = round(exam_pct(e) - exam_pct(s.exams[-2]), 1)
+        chips.append(f"<span class='chip {'good' if diff >= 0 else 'hot'}'>지난 시험보다 {diff:+g}점</span>")
+    target = _int(s.get("set_target"), 90, 0, 100)
+    chips.append(f"<span class='chip {'good' if exam_pct(e) >= target else ''}'>목표 {target}점</span>")
+    chips.append("<span class='chip'>" + ("오답 노트·복습 기록에 반영했어요" if r["applied"]
+                                       else "오답 노트·복습 기록에는 반영하지 않았어요") + "</span>")
+    html("<div class='chips'>" + "".join(chips) + "</div>")
+    st.markdown("##### 유형별 점수")
+    st.dataframe(pd.DataFrame([{"유형": EXAM_TYPES[k], "맞힌 문항": f"{v['right']} / {v['n']}",
+                                "점수": f"{fmt_pts(v['score'])} / {fmt_pts(v['max'])}"}
+                               for k, v in e["types"].items()]), width="stretch", hide_index=True)
+    if r["wrong"]:
+        st.markdown("##### 틀린 문제")
+        st.dataframe(pd.DataFrame(r["wrong"]), width="stretch", hide_index=True)
+    else:
+        st.success("전부 맞혔어요! 🎉")
+    st.markdown("##### 점수 추이")
+    render_exam_history()
+    st.button("🔁 새 모의고사 보기", type="primary", on_click=close_exam_result, width="stretch", key="ex_new")
+
+
+# --- 화면: 시작 설정 ------------------------------------------------------------------
+def render_exam_setup():
+    s = st.session_state
+    st.subheader("모의고사 (100점 만점)")
+    st.caption("정답은 끝난 뒤에 한꺼번에 보여줘요. 힌트는 없고, 시간 제한도 없어요. 걸린 시간만 기록해요. "
+               "(모르겠어요는 오답, 빈칸도 괜찮아요)")
+    if s.get("ex_src") not in EXAM_SRC:
+        s.ex_src = EXAM_SRC[0]
+    st.radio("출제 범위", EXAM_SRC, key="ex_src", horizontal=True)
+    if s.ex_src == "분류 선택":
+        groups = sorted({w["group"] for w in s.words if w.get("group")},
+                        key=lambda g: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", g)])
+        if groups:
+            s.ex_groups = [g for g in s.get("ex_groups", []) if g in groups]
+            st.multiselect("분류 (비워 두면 전체)", groups, key="ex_groups", placeholder="전체 (눌러서 고르기)")
+        else:
+            st.caption("분류가 적힌 한자가 없어서 전체에서 나와요.")
+    pool = exam_pool()
+    lim = exam_limits(pool)
+    why = exam_blocked_reasons(lim, pool)
+    st.markdown("**유형별 문항 수와 배점**")
+    h = st.columns([5, 3, 3])
+    h[0].caption("유형")
+    h[1].caption("문항 수")
+    h[2].caption("문항당 배점")
+    for k in EXAM_ORDER:
+        off = lim[k] == 0
+        r = st.columns([5, 3, 3], vertical_alignment="center")
+        r[0].write(EXAM_TYPES[k] + (" 🔒" if off else ""))
+        r[1].number_input("문항 수", 0, 100, step=1, key=f"ex_n_{k}", label_visibility="collapsed", disabled=off)
+        r[2].number_input("배점", 0.0, 100.0, step=0.5, format="%.1f", key=f"ex_pt_{k}",
+                          label_visibility="collapsed", disabled=off)
+        if off and k in why:
+            st.caption(f"🔒 {EXAM_TYPES[k]}: {why[k]}")
+    n_all, tot = exam_total(lim)
+    need = sum(0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100) for k in ("ko", "write", "choice"))
+    if need > len(pool):
+        st.warning(f"범위 안 한자가 {len(pool)}개라서 한자 문항 {need}개를 다 채울 수 없어요. 모자란 만큼 줄어들어요.")
+    m1, m2 = st.columns(2)
+    m1.metric("총 문항", f"{n_all}개")
+    m2.metric("배점 합계", f"{fmt_pts(tot)}점")
+    if n_all and abs(tot - 100.0) > 0.05:
+        st.warning(f"배점 합계가 {fmt_pts(tot)}점이에요. 100점 만점이 아니에요.")
+        st.button("⚖️ 100점으로 맞추기", on_click=fit_points, width="stretch", key="ex_fit",
+                  help="지금 배점의 비율은 그대로 두고 합계만 100점이 되게 조정해요. (소수 첫째 자리)")
+        st.caption("소수 첫째 자리로 반올림하기 때문에 정확히 100점이 안 될 수도 있어요. 그땐 배점을 직접 조정해 주세요.")
+    if s.get("ex_apply") not in ["반영해요", "반영 안 해요"]:
+        s.ex_apply = "반영해요"
+    st.radio("시험이 끝나면 결과를 오답 노트·복습 기록에 …", ["반영해요", "반영 안 해요"], key="ex_apply", horizontal=True,
+             help="'반영해요'를 고르면 틀린 문제는 오답 노트에 담기고, 맞고 틀림이 복습 주기와 통계에도 들어가요.")
+    st.caption("사자성어 문항은 범위와 상관없이 전체 사자성어에서 나와요. (범위가 '오답 노트만'이면 사자성어 오답에서 나와요)")
+    st.button("▶️ 시험 시작", type="primary", on_click=start_exam, disabled=(n_all == 0), width="stretch", key="ex_start")
+    if s.exams:
+        with st.expander("📈 지난 모의고사 기록"):
+            st.caption(f"지금까지 {len(s.exams)}회")
+            render_exam_history()
+
+
+def render_exam():
+    s = st.session_state
+    if s.exam:
+        render_exam_run()
+    elif s.exam_result:
+        render_exam_result()
+    else:
+        render_exam_setup()
+
+
+# ----------------------------------------------------------------------
+# 시험 날짜 기반 학습 플랜 (연습 탭 맨 위 카드) — 모두 '참고용' 계산이에요
+# ----------------------------------------------------------------------
+def exam_dday():
+    """시험까지 남은 일수 (날짜가 없으면 None, 지났으면 음수)"""
+    d = _iso(st.session_state.get("set_exam_date", ""))
+    return (date.fromisoformat(d) - today_date()).days if d else None
+
+
+def plan_words():
+    s = st.session_state
+    groups = s.get("plan_groups", [])
+    return [w for w in s.words if not groups or w.get("group") in groups]
+
+
+def recent_accuracy(words, days=14):
+    """최근 정답률. 최근 14일 푼 문제가 5개 미만이면 범위 한자의 누적 정답률로 대신해요"""
+    s = st.session_state
+    r = w = 0
+    for i in range(days):
+        h = s.history.get((today_date() - timedelta(days=i)).isoformat())
+        if h:
+            r += h.get("right", 0)
+            w += h.get("wrong", 0)
+    if r + w >= 5:
+        return r / (r + w), "최근 14일"
+    r = sum(s.stats.get(x["hanja"], {}).get("right", 0) for x in words)
+    w = sum(s.stats.get(x["hanja"], {}).get("wrong", 0) for x in words)
+    return (r / (r + w) if r + w else 0.0), "누적"
+
+
+def plan_numbers():
+    """플랜 계산 결과 dict (시험일이 없거나 지났으면 None)"""
+    s = st.session_state
+    D = exam_dday()
+    if D is None or D < 0:
+        return None
+    words = plan_words()
+    unseen = sum(1 for w in words if w["hanja"] not in s.srs)
+    new_today = 0 if D <= 2 else min(unseen, math.ceil(unseen / max(1, D - 2)))
+    _n, review = due_counts(words)
+    seen_ratio = (len(words) - unseen) / len(words) if words else 0.0
+    acc, acc_src = recent_accuracy(words)
+    return {"D": D, "total": len(words), "unseen": unseen, "new_today": new_today, "review": review,
+            "seen_ratio": seen_ratio, "acc": acc, "acc_src": acc_src,
+            "expected": round(100 * seen_ratio * acc)}
+
+
+def start_plan():
+    """오늘 복습 + 오늘 새 한자를 묶어서 기존 start_quiz 흐름으로 시작"""
+    s = st.session_state
+    p = plan_numbers()
+    if not p:
+        return
+    pool = due_pool(plan_words())
+    review = [w for w in pool if w["hanja"] in s.srs]
+    new = [w for w in pool if w["hanja"] not in s.srs][: p["new_today"]]
+    items = review + new
+    if not items:
+        s.flash = "오늘 플랜에 넣을 한자가 없어요. 내일 다시 만나요! 🎉"
+        return
+    start_quiz(pool_override=items, count_override=min(len(items), 200))
+
+
+def clear_exam_date():
+    st.session_state.set_exam_date = ""
+
+
+def render_plan_card():
+    s = st.session_state
+    p = plan_numbers()
+    D = exam_dday()
+    with st.container(border=True):
+        st.markdown("##### 📅 시험 플랜")
+        if p is None:
+            if D is not None:
+                st.info("시험일이 지났어요. 새 시험 날짜를 정하면 플랜이 다시 만들어져요.")
+            else:
+                st.caption("시험 날짜와 목표 점수를 정하면, 오늘 새로 볼 한자와 복습할 한자를 계산해 드려요.")
+        elif p["total"] == 0:
+            st.info("플랜 범위에 한자가 없어요. 아래 설정에서 범위를 바꿔 주세요.")
+        else:
+            dd = "D-Day" if p["D"] == 0 else f"D-{p['D']}"
+            target = _int(s.get("set_target"), 90, 0, 100)
+            chips = [f"<span class='chip hot'>{dd}</span>",
+                     f"<span class='chip'>🌱 오늘 새 한자 {p['new_today']}개</span>",
+                     f"<span class='chip'>🔁 오늘 복습 {p['review']}개</span>",
+                     f"<span class='chip'>안 본 한자 {p['unseen']}개</span>"]
+            html("<div class='chips'>" + "".join(chips) + "</div>")
+            html(f"<div class='score-box'><div class='big'>예상 {p['expected']}점 / 목표 {target}점</div>"
+                 f"<div class='lbl'>참고용 · 본 한자 {p['seen_ratio']:.0%} × 최근 정답률 {p['acc']:.0%}</div></div>")
+            if s.exams:
+                last = s.exams[-1]
+                st.caption(f"최근 모의고사 {fmt_pts(exam_pct(last))}점 ({last['date']})")
+            if p["D"] <= 2:
+                st.caption("시험 직전 이틀은 새 한자 없이 복습만 해요.")
+            n_today = p["review"] + p["new_today"]
+            st.button(f"▶️ 오늘 플랜 시작 (복습 {p['review']} + 새 한자 {p['new_today']})", type="primary",
+                      on_click=start_plan, disabled=(n_today == 0), width="stretch", key="plan_start")
+            if n_today == 0:
+                st.caption("오늘 할 몫을 다 했어요. 🎉 '시험' 탭에서 모의고사로 실력을 확인해 보세요.")
+            st.caption("계산 방법(참고용): 오늘 새 한자 = 안 본 한자 ÷ (남은 날 − 2)를 올림 (마지막 이틀은 복습 기간) · "
+                       "예상 점수 = 100 × 본 한자 비율 × 최근 정답률 · 오늘 복습 = 복습 날짜가 된 한자")
+        with st.expander("⚙️ 플랜 설정", expanded=(D is None)):
+            with st.form("plan_form", border=False):
+                cur = _iso(s.get("set_exam_date", ""))
+                today = today_date()
+                value = max(date.fromisoformat(cur), today) if cur else today + timedelta(days=14)
+                d = st.date_input("시험 날짜", value=value, min_value=today, format="YYYY/MM/DD")
+                st.number_input("목표 점수 (0~100)", 0, 100, step=5, key="set_target")
+                groups = sorted({w["group"] for w in s.words if w.get("group")},
+                                key=lambda g: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", g)])
+                if groups:
+                    s.plan_groups = [g for g in s.get("plan_groups", []) if g in groups]
+                    st.multiselect("플랜 범위 분류 (비워 두면 전체)", groups, key="plan_groups",
+                                   placeholder="전체 (눌러서 고르기)")
+                saved = st.form_submit_button("💾 플랜 저장", type="primary", width="stretch")
+            if saved:
+                s.set_exam_date = d.isoformat()
+                st.toast("플랜을 저장했어요.")
+                st.rerun()
+            if cur:
+                st.button("시험 날짜 지우기", on_click=clear_exam_date, key="plan_clear")
+
+
+# --- 단어장 탭: 별표·메모 / 내장 단어장 / 편집 ---------------------------------------
+def render_note_tools(words):
+    s = st.session_state
+    n_star = sum(1 for e in s.notes.values() if e.get("star"))
+    n_memo = sum(1 for e in s.notes.values() if e.get("note"))
+    with st.expander("⭐ 별표·메모"):  # 제목을 고정해야 눌러도 접히지 않아요
+        st.caption(f"지금 ★ {n_star}개 · 메모 {n_memo}개")
+        if not words:
+            st.caption("지금 보이는 한자가 없어요. 위 검색을 지우고 다시 해 보세요.")
+            return
+        by = {w["hanja"]: w for w in s.words}
+        opts = [w["hanja"] for w in words][:3000]
+
+        def fmt(h):
+            w = by.get(h, {})
+            return f"{'★ ' if is_star(h) else ''}{h}  {w.get('meaning', '')} {w.get('sound', '')}".strip()
+
+        if s.get("nt_pick") not in opts:
+            s.nt_pick = opts[0]
+        h = st.selectbox("한자 고르기 (위 검색으로 좁힐 수 있어요)", opts, key="nt_pick", format_func=fmt)
+        star = is_star(h)
+        st.button("★ 별표 빼기" if star else "☆ 별표 주기", key="nt_star", on_click=toggle_star,
+                  args=(h, not star), width="stretch")
+        with st.form("nt_form", border=False):
+            txt = st.text_area(f"'{h}' 내 메모 (최대 {MAX_NOTE}자)", value=note_of(h), max_chars=MAX_NOTE,
+                               key=f"nt_txt_{h}", height=90)
+            saved = st.form_submit_button("💾 메모 저장", type="primary", width="stretch")
+        if saved:
+            save_note(h, txt)
+        s.nt_bulk = [x for x in s.get("nt_bulk", []) if x in opts]
+        with st.form("nt_bulk_form", border=False):
+            st.multiselect("별표를 한꺼번에 주거나 뺄 한자", opts, key="nt_bulk", format_func=fmt,
+                           placeholder="여러 개 고르기")
+            b1, b2 = st.columns(2)
+            b1.form_submit_button("★ 별표 주기", on_click=bulk_star, args=(True,), width="stretch")
+            b2.form_submit_button("☆ 별표 빼기", on_click=bulk_star, args=(False,), width="stretch")
+        st.caption("별표를 준 한자는 연습·카드의 '별표 한자만' 범위로 풀 수 있고, 모의고사 범위로도 골라요.")
+
+
+def render_word_edit():
+    s = st.session_state
+    with st.expander("✏️ 단어장 편집 (추가 · 수정 · 삭제)"):
+        st.caption("저장하면 단어장이 바뀌고 이 기기에 자동 저장돼요. 진행 중이던 퀴즈·카드는 비워져요.")
+        ver = s.ed_ver
+        st.markdown("**한 개 추가**")
+        with st.form("word_add_form", border=False):
+            c1, c2 = st.columns(2)
+            h = c1.text_input("한자", key=f"wa_h_{ver}")
+            sd = c2.text_input("음", key=f"wa_s_{ver}")
+            c3, c4 = st.columns(2)
+            m = c3.text_input("뜻", key=f"wa_m_{ver}")
+            g = c4.text_input("분류 (선택)", key=f"wa_g_{ver}")
+            add = st.form_submit_button("➕ 한자 추가", type="primary", width="stretch")
+        if add:
+            h, m, sd, g = re.sub(r"\s+", "", h or ""), (m or "").strip(), (sd or "").strip(), (g or "").strip()
+            why = word_problem(h, m, sd, g)
+            if not why and any(w["hanja"] == h for w in s.words):
+                why = "이미 있는 한자예요. 아래 표에서 고쳐 주세요."
+            if why:
+                st.warning(why)
+            else:
+                commit_words(s.words + [{"hanja": h, "meaning": m, "sound": sd, "group": g}])
+                st.rerun()
+        st.markdown("**표로 고치기**")
+        st.caption("칸을 눌러 고치고, 표 맨 아래 빈 줄에서 새 줄을 더하고, 줄 왼쪽 칸을 눌러 고른 뒤 휴지통(또는 Delete 키)으로 지워요. "
+                   "다 고쳤으면 '저장'을 눌러 주세요.")
+        with st.form("word_edit_form", border=False):
+            edited = st.data_editor(
+                words_df(s.words), num_rows="dynamic", hide_index=True, key=f"word_editor_{ver}",
+                column_config={
+                    "한자": st.column_config.TextColumn("한자", max_chars=12),
+                    "뜻": st.column_config.TextColumn("뜻", max_chars=100),
+                    "음": st.column_config.TextColumn("음", max_chars=60),
+                    "분류": st.column_config.TextColumn("분류", max_chars=30),
+                })
+            saved = st.form_submit_button("💾 단어장 저장", type="primary", width="stretch")
+        if saved:
+            new, errs = words_from_df(edited)
+            if errs:
+                st.error("저장하지 못했어요. 아래를 고친 뒤 다시 눌러 주세요.\n\n"
+                         + "\n".join(f"- {e}" for e in errs[:8])
+                         + (f"\n- … 외 {len(errs) - 8}건" if len(errs) > 8 else ""))
+            elif not new:
+                st.error("한자가 하나도 없으면 저장할 수 없어요.")
+            elif new == s.words:
+                st.info("바뀐 내용이 없어요.")
+            else:
+                commit_words(new)
+                st.rerun()
+        st.download_button("📥 현재 단어장 CSV 받기", words_csv(s.words), "내_단어장.csv", "text/csv", width="stretch")
+        st.caption("받은 파일을 GitHub 저장소의 wordsets/ 폴더에 올리면 '내장 단어장'이 돼요. 파일 이름이 세트 이름이에요.")
+
+
+def render_set_tools():
+    with st.expander("📂 내장 단어장 불러오기"):
+        set_picker("word", "study", show=False)
+    render_word_edit()
+
 
 
 def main():
