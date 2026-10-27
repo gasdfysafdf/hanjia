@@ -727,16 +727,12 @@ TYPE_LABELS = {
 }
 SETTING_DEFAULTS = dict(
     set_type="섞어서", set_source="전체 단어", set_count=10, set_shuffle=True, set_groups=[],
-    set_goal=20, set_stroke=8, set_canvas=280,
+    set_goal=20, set_stroke=8, set_canvas_px=220,
     card_src="전체 단어", card_dir="한자 → 뜻·음", card_shuffle=True, card_count=20,
     # 시험 플랜
     set_exam_date="", set_target=90, plan_groups=[],
     # 사자성어
-    idm_view="시험", idm_src="전체", idm_type="섞어서", idm_count=10, idm_groups=[],
-    # 모의고사
-    ex_src="전체 단어", ex_groups=[], ex_apply="반영해요",
-    ex_n_ko=10, ex_n_write=5, ex_n_choice=5, ex_n_idiom=0,
-    ex_pt_ko=5.0, ex_pt_write=5.0, ex_pt_choice=5.0, ex_pt_idiom=5.0,
+    idm_view="목록", idm_src="전체", idm_type="섞어서", idm_count=10,
 )
 KEEP_KEYS = list(SETTING_DEFAULTS)  # 화면에 없는 동안에도 값이 사라지지 않게 붙잡아 둘 설정들
 
@@ -762,10 +758,9 @@ def init_state():
         wrong={}, stats={}, nonce=0, retry_mode=False, hint=False, flash="",
         progress_sig=None, calib=[], set_preset="보통", srs={}, history={}, cards=None, sheet=None,
         restored=False, store_ok=None,
-        notes={}, idioms=[], idiom_stats={}, idiom_wrong={}, exams=[],
-        iquiz=[], ipos=0, ires=[], inonce=0, iretry=False, idm_confirm="",
-        exam=None, exam_result=None, ex_nonce=0, ex_quit=False,
-        ed_ver=0, ied_ver=0, notice=None, hw_clear=0,
+        notes={}, idioms=[], idiom_sig=None, idiom_stats={}, idiom_wrong={},
+        iquiz=[], ipos=0, ires=[], inonce=0, iretry=False,
+        ed_ver=0, notice=None, hw_clear=0,
     )
     defaults.update(GRADE_DEFAULTS)
     defaults.update(SETTING_DEFAULTS)
@@ -1024,13 +1019,12 @@ def reset_all():
     """퀴즈 + 오답 노트 + 통계 + 복습 기록 전부 초기화 (불러온 단어는 유지)"""
     s = st.session_state
     s.wrong, s.stats, s.srs, s.history = {}, {}, {}, {}
-    s.idiom_stats, s.idiom_wrong, s.exams = {}, {}, []
+    s.idiom_stats, s.idiom_wrong = {}, {}
     s.cards = None
-    s.exam, s.exam_result, s.ex_quit = None, None, False
     reset_idiom_quiz()
     reset_quiz()
     s.confirm_reset = False
-    s.flash = "퀴즈, 오답 노트, 통계, 복습·시험 기록을 모두 초기화했어요. (단어장·사자성어·메모는 그대로예요)"
+    s.flash = "퀴즈, 오답 노트, 통계, 복습 기록을 모두 초기화했어요. (단어장·메모는 그대로예요)"
 
 
 # ----------------------------------------------------------------------
@@ -1039,18 +1033,9 @@ def reset_all():
 MAX_NOTE = 200  # 메모 한 개의 최대 글자 수
 MAX_NOTES = 3000  # 저장하는 메모·별표 개수 (브라우저 저장 용량을 지키려는 상한)
 MAX_IDIOMS = 2000  # 사자성어 개수
-MAX_EXAMS = 100  # 모의고사 기록 개수
 IDIOM_MIN, IDIOM_MAX = 3, 8  # 사자성어 한자 글자 수
 MAX_SET_BYTES = 2_000_000  # 폴더 CSV 한 개의 최대 크기
 
-EXAM_ORDER = ["ko", "write", "choice", "idiom"]
-EXAM_TYPES = {
-    "ko": "한자 → 뜻·음 쓰기",
-    "write": "뜻·음 → 한자 쓰기 (손글씨)",
-    "choice": "객관식",
-    "idiom": "사자성어",
-}
-EXAM_SRC = ["전체 단어", "분류 선택", "별표 한자만", "오답 노트만"]
 IDIOM_LABELS = {
     "i_read": "사자성어 → 독음 쓰기",
     "i_ch_snd": "독음 → 사자성어 고르기",
@@ -1067,7 +1052,7 @@ IDIOM_KIND_TYPES = {
     "빈칸 고르기": ["i_blank"],
     "빈칸 손글씨": ["i_hw"],
 }
-IDIOM_SRC = ["전체", "분류 선택", "오답 노트만"]
+IDIOM_SRC = ["전체", "오답 노트만"]
 SOURCES = ["전체 단어", "오늘 복습할 것", "오답 노트만", "별표 한자만"]
 
 
@@ -1183,24 +1168,6 @@ def _clean_notes(d):
         if note or star:
             out[str(k)[:30]] = {"note": note, "star": star}
     return out
-
-
-def _clean_exam(e):
-    if not isinstance(e, dict):
-        return None
-    day = _iso(e.get("date"))
-    if not day:
-        return None
-    full = _flt(e.get("full"), 100.0, 0.1, 10000.0)
-    types = {}
-    for k, v in _dict(e.get("types")).items():
-        if k in EXAM_TYPES and isinstance(v, dict):
-            mx = _flt(v.get("max"), 0.0, 0.0, 10000.0)
-            types[k] = {"score": round(_flt(v.get("score"), 0.0, 0.0, mx), 1), "max": round(mx, 1),
-                        "n": _int(v.get("n"), 0, 0, 1000), "right": _int(v.get("right"), 0, 0, 1000)}
-    return {"start": str(e.get("start", ""))[:19] or day, "date": day,
-            "score": round(_flt(e.get("score"), 0.0, 0.0, full), 1), "full": round(full, 1),
-            "n": _int(e.get("n"), 0, 0, 1000), "types": types, "secs": _int(e.get("secs"), 0, 0, 10**6)}
 
 
 def _clean_idiom_key(k):
@@ -1563,13 +1530,11 @@ def words_from_df(df):
 
 
 def reset_views():
-    """단어장이 바뀔 때: 진행 중이던 퀴즈·카드·시험지·모의고사를 안전하게 비워요 (기록은 그대로)"""
+    """단어장이 바뀔 때: 진행 중이던 퀴즈·카드·시험지를 안전하게 비워요 (기록은 그대로)"""
     s = st.session_state
     s.quiz, s.pos, s.results, s.feedback, s.cards, s.sheet = [], 0, [], None, None, None
     s.hint = False
     s.nonce += 1
-    s.exam, s.ex_quit = None, False
-    s.ex_nonce += 1
 
 
 def reset_idiom_quiz():
@@ -1645,25 +1610,18 @@ STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body st
 </script></body></html>"""
 
 PERSIST_KEYS = [
-    "set_goal", "set_stroke", "set_canvas", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
+    "set_goal", "set_stroke", "set_canvas_px", "set_type", "set_source", "set_count", "set_shuffle", "set_preset",
     "card_src", "card_dir", "card_shuffle", "card_count",
     "set_exam_date", "set_target", "plan_groups", "idm_src", "idm_type", "idm_count",
-    "ex_src", "ex_apply",
-    "ex_n_ko", "ex_n_write", "ex_n_choice", "ex_n_idiom",
-    "ex_pt_ko", "ex_pt_write", "ex_pt_choice", "ex_pt_idiom",
 ] + list(GRADE_DEFAULTS)
 # 저장값 범위 (엉뚱한 값이 들어 있어도 위젯이 깨지지 않게 이 안으로 맞춰요)
 SETTING_RANGES = {"set_target": (0, 100), "idm_count": (5, 50)}
-SETTING_RANGES.update({f"ex_n_{k}": (0, 100) for k in EXAM_ORDER})
-SETTING_RANGES.update({f"ex_pt_{k}": (0.0, 100.0) for k in EXAM_ORDER})
 ALLOWED = {
     "set_type": ["섞어서", "뜻·음 쓰기", "한자 쓰기", "객관식"],
     "set_source": SOURCES,
     "card_src": SOURCES,
     "idm_src": IDIOM_SRC,
     "idm_type": IDIOM_KINDS,
-    "ex_src": EXAM_SRC,
-    "ex_apply": ["반영해요", "반영 안 해요"],
     "card_dir": ["한자 → 뜻·음", "뜻·음 → 한자"],
     "set_preset": ["관대", "보통", "엄격", "직접 설정"],
 }
@@ -1695,8 +1653,8 @@ def _clean_word(w):
 
 def sanitize_progress(d):
     """파일/브라우저에서 읽은 기록을 검사해서, 엉뚱한 값이 섞여 있어도 앱이 깨지지 않게 걸러 줘요"""
-    out = {"wrong": {}, "stats": {}, "srs": {}, "history": {}, "notes": {}, "idioms": [],
-           "idiom_stats": {}, "idiom_wrong": {}, "exams": [], "plan": {}}
+    out = {"wrong": {}, "stats": {}, "srs": {}, "history": {}, "notes": {},
+           "idiom_stats": {}, "idiom_wrong": {}, "plan": {}}
     if not isinstance(d, dict):
         return out
     for k, v in _dict(d.get("wrong")).items():
@@ -1721,7 +1679,6 @@ def sanitize_progress(d):
             out["history"][_iso(day)] = {"right": _int(v.get("right")), "wrong": _int(v.get("wrong"))}
     # 새 항목 (옛 저장값에는 없으니 없으면 빈 값)
     out["notes"] = _clean_notes(d.get("notes"))
-    out["idioms"] = _clean_idioms(d.get("idioms"))
     for k, v in _dict(d.get("idiom_stats")).items():
         if isinstance(v, dict) and _clean_idiom_key(k):
             out["idiom_stats"][str(k)] = {"sound": str(v.get("sound", "")), "meaning": str(v.get("meaning", "")),
@@ -1731,8 +1688,6 @@ def sanitize_progress(d):
             out["idiom_wrong"][str(k)] = {
                 "hanja": str(k), "sound": str(v.get("sound", "")), "meaning": str(v.get("meaning", "")),
                 "wrong_count": _int(v.get("wrong_count"), 1, 1), "last": str(v.get("last", ""))}
-    exams = [c for c in (_clean_exam(e) for e in (d.get("exams") if isinstance(d.get("exams"), list) else [])) if c]
-    out["exams"] = sorted(exams, key=lambda e: e["start"])[-MAX_EXAMS:]
     p = _dict(d.get("plan"))
     if "exam_date" in p:
         out["plan"]["exam_date"] = _iso(p["exam_date"]) or ""
@@ -1753,19 +1708,8 @@ def merge_progress(clean):
         cur["right"] = max(cur["right"], v["right"])
         cur["wrong"] = max(cur["wrong"], v["wrong"])
     s.notes.update(clean.get("notes", {}))
-    have = {i["hanja"] for i in s.idioms}  # 사자성어는 이미 있는 것을 유지하고 없는 것만 더해요
-    for it in clean.get("idioms", []):
-        if it["hanja"] not in have and len(s.idioms) < MAX_IDIOMS:
-            s.idioms.append(it)
-            have.add(it["hanja"])
     s.idiom_stats.update(clean.get("idiom_stats", {}))
     s.idiom_wrong.update(clean.get("idiom_wrong", {}))
-    starts = {e["start"] for e in s.exams}
-    for e in clean.get("exams", []):
-        if e["start"] not in starts:
-            s.exams.append(e)
-            starts.add(e["start"])
-    s.exams = sorted(s.exams, key=lambda e: e["start"])[-MAX_EXAMS:]
     plan = clean.get("plan") or {}
     if "exam_date" in plan:
         s.set_exam_date = plan["exam_date"]
@@ -1779,8 +1723,7 @@ def progress_json():
     s = st.session_state
     return json.dumps(
         {"wrong": s.wrong, "stats": s.stats, "srs": s.srs, "history": s.history,
-         "notes": s.notes, "idioms": s.idioms, "idiom_stats": s.idiom_stats, "idiom_wrong": s.idiom_wrong,
-         "exams": s.exams,
+         "notes": s.notes, "idiom_stats": s.idiom_stats, "idiom_wrong": s.idiom_wrong,
          "plan": {"exam_date": s.get("set_exam_date", ""), "target": s.get("set_target", 90),
                   "groups": s.get("plan_groups", [])}},
         ensure_ascii=False, indent=2,
@@ -1790,8 +1733,8 @@ def progress_json():
 def build_payload():
     s = st.session_state
     data = {"v": 2, "words": s.words, "wrong": s.wrong, "stats": s.stats, "srs": s.srs,
-            "history": s.history, "notes": s.notes, "idioms": s.idioms, "idiom_stats": s.idiom_stats,
-            "idiom_wrong": s.idiom_wrong, "exams": s.exams,
+            "history": s.history, "notes": s.notes, "idiom_stats": s.idiom_stats,
+            "idiom_wrong": s.idiom_wrong,
             "settings": {k: s[k] for k in PERSIST_KEYS if k in s}}
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -1824,8 +1767,8 @@ def apply_payload(raw):
         if k in PERSIST_KEYS and k in defaults and type(v) is type(defaults[k]):
             if k in ALLOWED and v not in ALLOWED[k]:
                 continue
-            if k == "set_canvas":  # 엉뚱한 값이 저장돼 있어도 슬라이더가 깨지지 않게 범위 안으로
-                v = _int(v, 280, 200, 400)
+            if k == "set_canvas_px":  # 엉뚱한 값이 저장돼 있어도 슬라이더가 깨지지 않게 범위 안으로
+                v = _int(v, 220, 140, 360)
             if k == "set_exam_date":
                 v = _iso(v) or ""
             if k == "plan_groups":
@@ -1836,7 +1779,7 @@ def apply_payload(raw):
                 if k == "idm_count":
                     v = max(5, min(50, int(round(v / 5.0)) * 5))
             s[k] = v
-    return bool(s.words or s.wrong or s.stats or s.srs or s.history or s.idioms or s.notes or s.exams
+    return bool(s.words or s.wrong or s.stats or s.srs or s.history or s.notes
                 or s.idiom_stats or s.idiom_wrong)
 
 
@@ -1854,7 +1797,7 @@ def sync_browser_store():
     실패해도 앱은 평소처럼 동작해요(저장만 안 될 뿐)."""
     s = st.session_state
     save = ""
-    if s.restored and (s.words or s.wrong or s.stats or s.srs or s.history or s.idioms or s.notes or s.exams
+    if s.restored and (s.words or s.wrong or s.stats or s.srs or s.history or s.notes
                        or s.idiom_stats or s.idiom_wrong):
         save = build_payload()  # 불러오기 전에는 저장하지 않아서, 빈 상태가 기존 기록을 덮어쓰지 않아요
     try:
@@ -1882,7 +1825,6 @@ def repair_state():
     s.quiz, s.pos, s.results, s.feedback, s.cards, s.sheet = [], 0, [], None, None, None
     s.hint = False
     s.nonce += 1
-    s.exam, s.exam_result, s.ex_quit = None, None, False
     s.iquiz, s.ipos, s.ires = [], 0, []
     s.flash = "화면을 정리했어요."
 
@@ -2043,7 +1985,7 @@ CSS = """
 .memo{max-width:520px; margin:.4rem auto .8rem; padding:.6rem .9rem; background:#FFF7E0; color:var(--ink);
   border-left:4px solid var(--seal); border-radius:6px; white-space:pre-wrap; font-size:.98rem;}
 
-/* 모의고사·사자성어 고르기 버튼 (흰 바탕 + 어두운 글씨) */
+/* 사자성어 고르기 버튼 (흰 바탕 + 어두운 글씨) */
 div[class*="st-key-xc_"] button{min-height:4rem; background:#fff; border:1.5px solid var(--line);}
 div[class*="st-key-xc_"] button, div[class*="st-key-xc_"] button p{color:var(--ink);}
 div[class*="st-key-xc_text"] button p{font-size:1.1rem;}
@@ -2053,6 +1995,15 @@ div[class*="st-key-xc_hj"] button p, div[class*="st-key-xc_blank"] button p{font
 @media (max-width:640px){
   .stTabs [data-baseweb="tab"]{padding:0 .6rem; font-size:.92rem; height:2.9rem;}
 }
+
+/* 사자성어 목록 */
+.idm{background:#fff; border:1px solid var(--line); border-radius:10px; padding:.55rem .8rem; margin:.4rem 0; color:var(--ink);}
+.idm .idm-h{font:700 1.45rem/1.3 var(--serif); letter-spacing:.06em;}
+.idm .idm-s{color:var(--indigo); font-weight:600; margin-left:.4rem;}
+.idm .idm-m{color:var(--soft); font-size:.92rem; margin-top:.15rem; line-height:1.4;}
+.idm summary{cursor:pointer; list-style:none;}
+.idm .miss{color:#C0392B; border-bottom:2px solid #C0392B;}
+details.idm[open] summary{margin-bottom:.3rem;}
 
 /* 시작 화면 3단계 */
 .steps{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:.4rem 0 1rem;}
@@ -2212,7 +2163,7 @@ def render_welcome():
               help="파일이 없어도 샘플 한자 22개로 바로 체험해 볼 수 있어요.")
     set_picker("word", "welcome")
     load_panel()
-    st.caption("🈴 사자성어와 모의고사는 단어장을 불러온 뒤 '사자성어'·'시험' 탭에서 쓸 수 있어요.")
+    st.caption("🈴 단어장을 불러오면, 그 한자들로만 이루어진 사자성어가 '사자성어' 탭에 자동으로 나와요.")
     st.caption("💾 푼 기록과 단어장은 이 기기의 브라우저에 자동으로 저장돼서, 다시 들어오면 이어서 할 수 있어요. "
                "(다른 기기와는 따로 저장돼요)")
 
@@ -2343,7 +2294,7 @@ def answer_choice(w, ty, o):
 # --- 한자 쓰기 ----------------------------------------------------------------
 def canvas_px():
     """한자를 쓰는 칸의 한 변 길이(px). 사이드바의 '쓰는 칸 크기'에서 바꿀 수 있어요"""
-    return _int(st.session_state.get("set_canvas"), 280, 200, 400)
+    return _int(st.session_state.get("set_canvas_px"), 220, 140, 360)
 
 
 def flatten(data):
@@ -2394,7 +2345,7 @@ def render_write(w):
     s = st.session_state
     font = find_font()
     px = canvas_px()
-    left, right = st.columns([1, 1])
+    left, right = st.columns([3, 2])  # 쓰는 칸이 작아졌으니 오른쪽 칸도 좁게
     with left:
         meaning_card(w)
         html("<div class='ask'>에 해당하는 한자를 오른쪽 칸에 쓰세요</div>")
@@ -2935,12 +2886,12 @@ def sidebar():
             load_panel()
     st.sidebar.number_input("오늘의 목표 (문제 수)", 5, 500, step=5, key="set_goal")
     st.sidebar.slider("펜 굵기", 3, 20, key="set_stroke")
-    st.sidebar.slider("쓰는 칸 크기", 200, 400, step=20, key="set_canvas",
+    st.sidebar.slider("쓰는 칸 크기", 140, 360, step=20, key="set_canvas_px",
                       help="한자를 쓰는 칸의 크기예요. 화면이 작으면 줄이세요. (바꾸면 쓰던 글씨는 지워져요)")
     grading_sidebar()
 
     with st.sidebar.expander("💾 진행 상황 저장 / 불러오기"):
-        st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록·메모·사자성어·모의고사 기록·플랜 설정)")
+        st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록·메모·사자성어 기록·플랜 설정)")
         st.download_button("💾 저장", progress_json(), "hanja_progress.json", "application/json", width="stretch",
                            key="backup_side")
         pf = st.file_uploader("불러오기", type=["json"], key="progress_file")
@@ -2969,12 +2920,13 @@ def sidebar():
         st.caption("화면이 이상하게 동작하면 주소 끝에 ?nostore=1 을 붙여 접속해 보세요. (자동 저장 없이 실행)")
         st.divider()
         st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
-        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습·시험 기록 삭제)", key="confirm_reset")
+        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
         st.button("🗑️ 전체 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
 
 
 def run_app():
     sidebar()
+    refresh_idioms()  # 단어장 한자 → 사자성어 자동 연결
     s = st.session_state
     header()
     if not s.words:
@@ -2990,26 +2942,615 @@ def run_app():
         s.flash = ""
     if not HAS_CANVAS:
         st.warning("한자 쓰기 기능을 불러오지 못해 지금은 손글씨 문제를 풀 수 없어요. 왼쪽 메뉴의 '진단 정보'를 확인해 주세요.")
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(
-        ["✏️ 연습", "🃏 카드", "💯 시험", "📜 사자성어", "📕 오답", "📊 기록", "📚 단어장"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(
+        ["✏️ 연습", "🃏 카드", "📜 사자성어", "📕 오답", "📊 기록", "📚 단어장"])
     with t1:
         render_practice()
     with t2:
         render_cards()
     with t3:
-        render_exam()
-    with t4:
         render_idioms()
-    with t5:
+    with t4:
         render_wrong()
-    with t6:
+    with t5:
         render_stats()
-    with t7:
+    with t6:
         render_study()
 
 
 # ----------------------------------------------------------------------
-# 사자성어 (관리 · 시험 · 오답 노트) — 한자 통계와 섞지 않고 따로 저장해요
+# 내장 사자성어 사전 — 단어장 한자로만 이루어진 사자성어를 자동으로 골라 써요
+# ----------------------------------------------------------------------
+IDIOM_DB_TEXT = """
+街談巷說|가담항설|거리와 항간에 떠도는 소문이나 이야기
+刻骨難忘|각골난망|입은 은혜가 뼈에 새겨져 잊히지 않음
+刻舟求劍|각주구검|어리석고 융통성이 없어 세상 변화를 모름
+肝膽相照|간담상조|서로 마음을 터놓고 진심으로 사귐
+甘呑苦吐|감탄고토|비위에 맞으면 취하고 맞지 않으면 버림
+甘言利說|감언이설|남의 비위를 맞추는 달콤한 말과 이로운 조건으로 꾀는 말
+感之德之|감지덕지|몹시 고맙게 여김
+改過遷善|개과천선|지난 잘못을 고치고 착하게 됨
+去頭截尾|거두절미|머리와 꼬리를 자름: 앞뒤 다 빼고 요점만 말함
+居安思危|거안사위|편안할 때에도 닥칠 위험을 생각하고 대비함
+去者日疎|거자일소|떠난 사람은 날이 갈수록 멀어짐
+乾坤一擲|건곤일척|운명을 걸고 단판으로 승패를 겨룸
+牽强附會|견강부회|이치에 맞지 않는 말을 억지로 끌어다 붙임
+隔靴搔癢|격화소양|신 신고 발바닥 긁기: 일이 성에 차지 않아 답답함
+見蚊拔劍|견문발검|모기를 보고 칼을 뽑음: 사소한 일에 크게 성냄
+見物生心|견물생심|물건을 보면 갖고 싶은 마음이 생김
+犬馬之勞|견마지로|윗사람에게 바치는 자신의 노력을 낮추어 이르는 말
+犬猿之間|견원지간|개와 원숭이 사이: 몹시 사이가 나쁜 관계
+見危授命|견위수명|나라가 위태로울 때 목숨을 바침
+結草報恩|결초보은|죽어서도 은혜를 잊지 않고 갚음
+結者解之|결자해지|일을 저지른 사람이 그 일을 풀어야 함
+謙讓之德|겸양지덕|겸손하고 사양하는 미덕
+傾國之色|경국지색|나라를 기울게 할 만큼 뛰어난 미인
+敬而遠之|경이원지|겉으로는 공경하되 가까이하지는 않음
+驚天動地|경천동지|세상을 놀라게 함
+經世濟民|경세제민|세상을 다스려 백성을 구제함
+鷄卵有骨|계란유골|운이 나쁜 사람은 하는 일마다 안 풀림
+鷄鳴狗盜|계명구도|하찮은 재주도 때로는 쓸모가 있음
+孤軍奮鬪|고군분투|도움 없이 홀로 힘겹게 애씀
+高臺廣室|고대광실|매우 크고 좋은 집
+孤立無援|고립무원|고립되어 도움을 받을 곳이 없음
+孤掌難鳴|고장난명|손바닥 하나로는 소리를 내기 어려움: 혼자서는 일을 이루기 어려움
+鼓腹擊壤|고복격양|배를 두드리고 땅을 침: 태평한 세월을 즐김
+苦盡甘來|고진감래|고생 끝에 즐거움이 옴
+曲學阿世|곡학아세|학문을 굽혀 세상에 아첨함
+骨肉相爭|골육상쟁|가까운 혈족끼리 서로 다툼
+骨肉之親|골육지친|부모·형제·자식 등 가까운 혈육
+空中樓閣|공중누각|근거 없는 가공의 사물이나 이론
+公明正大|공명정대|공평하고 올바르며 사사로움이 없음
+公平無私|공평무사|공평하여 사사로움이 없음
+過猶不及|과유불급|지나친 것은 미치지 못한 것과 같음
+管鮑之交|관포지교|우정이 아주 두터운 사귐
+刮目相對|괄목상대|눈을 비비고 다시 볼 만큼 실력이 크게 늘었음
+矯角殺牛|교각살우|작은 흠을 고치려다 큰일을 그르침
+巧言令色|교언영색|아첨하는 말과 알랑거리는 얼굴빛
+敎學相長|교학상장|가르치고 배우는 가운데 서로 성장함
+九曲肝腸|구곡간장|굽이굽이 서린 마음속
+口蜜腹劍|구밀복검|입에는 꿀이 있고 배에는 칼이 있음: 겉으로는 친절하나 속은 음흉함
+九死一生|구사일생|여러 번 죽을 고비를 넘기고 겨우 살아남
+口尙乳臭|구상유취|입에서 젖내가 남: 말과 행동이 유치함
+九牛一毛|구우일모|많은 것 가운데 극히 적은 일부
+口是心非|구시심비|입으로는 옳다 하나 마음은 그르다 함
+九折羊腸|구절양장|아홉 번 꺾인 양의 창자: 꼬불꼬불한 길
+群鷄一鶴|군계일학|많은 닭 가운데 한 마리 학: 여럿 중 뛰어난 사람
+群雄割據|군웅할거|여러 영웅이 각지에서 세력을 다툼
+君臣有義|군신유의|임금과 신하 사이에는 의리가 있어야 함
+權謀術數|권모술수|목적을 위해 온갖 수단과 방법을 꾸밈
+勸善懲惡|권선징악|착한 일을 권하고 악한 일을 벌함
+捲土重來|권토중래|한 번 실패한 뒤 힘을 길러 다시 쳐들어옴
+金科玉條|금과옥조|소중히 여겨 꼭 지켜야 할 법칙이나 규정
+金蘭之契|금란지계|친구 사이의 매우 두터운 정
+金石之交|금석지교|쇠와 돌처럼 변치 않는 굳은 사귐
+今昔之感|금석지감|지금과 옛날을 비교할 때 느끼는 큰 차이감
+金城鐵壁|금성철벽|매우 튼튼하고 견고한 것
+錦上添花|금상첨화|좋은 일 위에 또 좋은 일이 더해짐
+錦衣還鄕|금의환향|비단옷을 입고 고향에 돌아옴: 성공하여 돌아옴
+金枝玉葉|금지옥엽|임금의 가족, 귀한 자손
+氣高萬丈|기고만장|일이 뜻대로 잘되어 매우 우쭐함
+奇巖怪石|기암괴석|기이하게 생긴 바위와 돌
+起死回生|기사회생|거의 죽을 뻔하다가 다시 살아남
+氣盡脈盡|기진맥진|기운과 힘이 다 빠져 없어짐
+騎虎之勢|기호지세|이미 내친 일이라 중도에 그만둘 수 없는 형세
+吉凶禍福|길흉화복|좋은 일과 나쁜 일, 재앙과 복
+落花流水|낙화유수|떨어지는 꽃과 흐르는 물: 봄의 끝 경치, 쇠퇴하는 모양
+難兄難弟|난형난제|누구를 형이라 하고 아우라 하기 어려움: 우열을 가리기 어려움
+南柯一夢|남가일몽|덧없는 한때의 부귀영화
+南橘北枳|남귤북지|환경에 따라 사람의 성질이 변함
+男女有別|남녀유별|남자와 여자 사이에는 분별이 있어야 함
+男負女戴|남부여대|남자는 지고 여자는 임: 가난한 사람들이 떠돌아다님
+囊中之錐|낭중지추|주머니 속의 송곳: 재능이 뛰어난 사람은 저절로 드러남
+內憂外患|내우외환|나라 안팎의 근심과 걱정
+勞心焦思|노심초사|몹시 애쓰며 속을 태움
+綠陰芳草|녹음방초|푸른 나무 그늘과 꽃다운 풀
+論功行賞|논공행상|공을 따져 상을 줌
+累卵之危|누란지위|쌓아 놓은 알처럼 몹시 위태로운 형세
+多多益善|다다익선|많을수록 더욱 좋음
+多岐亡羊|다기망양|갈림길이 많아 양을 잃음: 학문의 길이 많아 진리를 찾기 어려움
+單刀直入|단도직입|군말 없이 바로 요점으로 들어감
+斷金之交|단금지교|쇠도 자를 만큼 두터운 우정
+丹脣皓齒|단순호치|붉은 입술과 하얀 이: 아름다운 여자
+大器晩成|대기만성|큰 인물은 늦게 이루어짐
+大驚失色|대경실색|몹시 놀라 얼굴빛이 하얗게 변함
+大同小異|대동소이|거의 같고 조금 다름
+大書特筆|대서특필|특별히 크게 써서 드러냄
+大義名分|대의명분|마땅히 지켜야 할 도리와 본분
+同價紅裳|동가홍상|같은 값이면 다홍치마
+同苦同樂|동고동락|괴로움과 즐거움을 함께함
+東問西答|동문서답|묻는 말에 엉뚱한 대답을 함
+同病相憐|동병상련|같은 처지의 사람끼리 서로 가엾게 여김
+同床異夢|동상이몽|같은 자리에 있어도 속으로는 딴생각을 함
+東西古今|동서고금|동양과 서양, 옛날과 지금: 언제 어디서나
+同姓同本|동성동본|성도 본관도 같음
+東奔西走|동분서주|사방으로 이리저리 바쁘게 돌아다님
+同族相殘|동족상잔|같은 민족끼리 서로 해치며 싸움
+登高自卑|등고자비|높은 곳에 오르려면 낮은 곳에서부터 시작해야 함
+燈下不明|등하불명|등잔 밑이 어두움: 가까운 일을 오히려 잘 모름
+馬耳東風|마이동풍|남의 말을 귀담아듣지 않고 흘려버림
+莫上莫下|막상막하|우열을 가리기 어려움
+莫逆之友|막역지우|허물없이 아주 친한 벗
+萬古風霜|만고풍상|오랜 세월 겪은 많은 고생
+萬事亨通|만사형통|모든 일이 뜻대로 잘됨
+萬事休矣|만사휴의|모든 일이 끝장났음
+晩時之歎|만시지탄|때가 늦어 기회를 놓친 것을 한탄함
+滿身瘡痍|만신창이|온몸이 상처투성이: 일이 엉망이 됨
+亡羊補牢|망양보뢰|양을 잃고 우리를 고침: 이미 잘못된 뒤에 손을 써도 소용없음
+望洋之歎|망양지탄|남의 훌륭함을 보고 자신의 부족함을 한탄함
+明鏡止水|명경지수|맑은 거울과 고요한 물: 맑고 고요한 마음
+明明白白|명명백백|아주 분명하고 뚜렷함
+名實相符|명실상부|이름과 실제가 서로 들어맞음
+明若觀火|명약관화|불을 보듯 분명함
+明哲保身|명철보신|지혜롭고 사리에 밝아 몸을 잘 보전함
+目不識丁|목불식정|낫 놓고 기역자도 모름: 글자를 모르는 무식함
+目不忍見|목불인견|참혹하여 차마 볼 수 없음
+無不通知|무불통지|모르는 것이 없이 다 통함
+無所不爲|무소불위|하지 못하는 일이 없음
+無爲徒食|무위도식|하는 일 없이 놀고먹음
+無往不勝|무왕불승|가는 곳마다 이김
+門前成市|문전성시|찾아오는 사람이 많아 문 앞이 시장 같음
+物我一體|물아일체|외물과 내가 하나가 됨
+美辭麗句|미사여구|아름다운 말과 글귀
+美風良俗|미풍양속|아름답고 좋은 풍속
+博覽强記|박람강기|여러 책을 널리 읽고 잘 기억함
+博學多識|박학다식|학문이 넓고 아는 것이 많음
+拔本塞源|발본색원|폐단의 근본 원인을 완전히 뽑아 없앰
+傍若無人|방약무인|곁에 사람이 없는 듯 거리낌 없이 행동함
+背水之陣|배수지진|물을 등지고 친 진: 죽을 각오로 일에 임함
+杯盤狼藉|배반낭자|술 마시고 노는 자리가 어지러움
+背恩忘德|배은망덕|은덕을 잊고 배반함
+百家爭鳴|백가쟁명|많은 학자가 자유롭게 논쟁함
+白骨難忘|백골난망|죽어서도 은혜를 잊을 수 없음
+百年佳約|백년가약|부부가 되자는 아름다운 약속
+百年大計|백년대계|먼 앞날까지 내다보는 큰 계획
+百年河淸|백년하청|아무리 기다려도 이루어지기 어려움
+百發百中|백발백중|쏘는 대로 다 맞음: 계획이 모두 들어맞음
+白面書生|백면서생|오직 글만 읽어 세상일에 서투른 젊은이
+百戰百勝|백전백승|싸울 때마다 이김
+百折不屈|백절불굴|여러 번 꺾여도 굽히지 않음
+伯仲之間|백중지간|서로 우열을 가리기 어려운 사이
+父傳子傳|부전자전|아버지에서 아들로 대대로 전해짐
+夫唱婦隨|부창부수|남편이 이끌고 아내가 따름
+附和雷同|부화뇌동|주견 없이 남의 의견에 따라 움직임
+粉骨碎身|분골쇄신|뼈가 가루가 되고 몸이 부서지도록 애씀
+不俱戴天|불구대천|하늘을 함께 이고 살 수 없는 원수
+不問可知|불문가지|묻지 않아도 알 수 있음
+不問曲直|불문곡직|옳고 그름을 묻지 않음
+不撤晝夜|불철주야|밤낮을 가리지 않고 힘씀
+不恥下問|불치하문|손아랫사람에게 묻는 것을 부끄러워하지 않음
+悲憤慷慨|비분강개|슬프고 분하여 의분이 북받침
+非一非再|비일비재|한두 번이 아님
+氷炭之間|빙탄지간|얼음과 숯불 사이: 서로 맞지 않는 사이
+四面楚歌|사면초가|사방이 적에게 둘러싸여 고립됨
+四面春風|사면춘풍|누구에게나 호의적으로 대하는 처세
+四分五裂|사분오열|여러 갈래로 갈라지고 흩어짐
+士農工商|사농공상|선비·농부·장인·상인: 옛 신분 계급
+事必歸正|사필귀정|모든 일은 반드시 바른 길로 돌아감
+士氣衝天|사기충천|사기가 하늘을 찌를 듯 높음
+四通八達|사통팔달|길이 사방팔방으로 통함
+山高水長|산고수장|산은 높고 물은 길게 흐름: 군자의 덕이 높고 오래감
+山川草木|산천초목|산과 내와 풀과 나무: 자연
+山戰水戰|산전수전|세상의 온갖 고생과 어려움을 겪음
+山紫水明|산자수명|산빛은 자주빛, 물은 맑음: 자연 경치가 아름다움
+山海珍味|산해진미|산과 바다의 온갖 귀한 음식
+殺身成仁|살신성인|자신을 희생하여 인(仁)을 이룸
+三顧草廬|삼고초려|인재를 얻으려고 정성을 다해 노력함
+三三五五|삼삼오오|서넛 또는 대여섯 사람씩 무리를 지은 모양
+三旬九食|삼순구식|삼십 일에 아홉 끼니를 먹음: 몹시 가난함
+三人成虎|삼인성호|거짓말도 여러 사람이 하면 믿게 됨
+上善若水|상선약수|가장 좋은 것은 물과 같음
+桑田碧海|상전벽해|뽕나무밭이 푸른 바다가 됨: 세상이 크게 변함
+塞翁之馬|새옹지마|인생의 길흉화복은 예측하기 어려움
+生老病死|생로병사|사람이 겪는 네 가지 고통: 나고 늙고 병들고 죽음
+生面不知|생면부지|전혀 만난 적이 없어 알지 못하는 사람
+生死苦樂|생사고락|삶과 죽음, 괴로움과 즐거움
+先公後私|선공후사|공적인 일을 먼저 하고 사사로운 일은 뒤로 함
+先見之明|선견지명|앞일을 미리 내다보는 지혜
+雪上加霜|설상가상|눈 위에 서리가 내림: 어려운 일이 겹침
+說往說來|설왕설래|서로 말이 오고 감
+纖纖玉手|섬섬옥수|가냘프고 고운 여자의 손
+袖手傍觀|수수방관|팔짱을 끼고 보고만 있음
+水魚之交|수어지교|물과 물고기처럼 떨어질 수 없는 사이
+水落石出|수락석출|물이 빠지니 돌이 드러남: 진상이 밝혀짐
+手不釋卷|수불석권|손에서 책을 놓지 않음: 열심히 공부함
+首丘初心|수구초심|고향을 그리워하는 마음
+脣亡齒寒|순망치한|입술이 없으면 이가 시림: 서로 돕는 사이의 한쪽이 망하면 다른 쪽도 위태로움
+始終一貫|시종일관|처음부터 끝까지 한결같음
+始終如一|시종여일|처음과 끝이 한결같음
+時機尙早|시기상조|아직 때가 이르지 않음
+是是非非|시시비비|옳고 그름을 따짐
+識字憂患|식자우환|아는 것이 오히려 근심거리가 됨
+身土不二|신토불이|몸과 땅은 둘이 아님: 우리 땅에서 난 것이 몸에 맞음
+信賞必罰|신상필벌|상과 벌을 분명하게 내림
+十人十色|십인십색|사람마다 취향이 다름
+十中八九|십중팔구|열 가운데 여덟이나 아홉: 거의 대부분
+十匙一飯|십시일반|열 사람이 한 숟가락씩 모으면 한 사람이 먹을 밥이 됨
+深思熟考|심사숙고|깊이 생각하고 곰곰이 헤아림
+我田引水|아전인수|자기 논에 물 대기: 자기에게 이롭게만 생각하고 행동함
+安貧樂道|안빈낙도|가난해도 편안한 마음으로 도를 즐김
+眼下無人|안하무인|눈 아래 사람이 없음: 교만하여 남을 업신여김
+暗中摸索|암중모색|어둠 속에서 더듬어 찾음: 단서 없이 짐작으로 찾음
+弱肉强食|약육강식|약한 것이 강한 것에게 먹힘
+羊頭狗肉|양두구육|겉은 훌륭하나 속은 보잘것없음
+良藥苦口|양약고구|좋은 약은 입에 씀: 충고는 듣기 싫으나 이로움
+羊質虎皮|양질호피|겉모양은 훌륭하나 실속이 없음
+漁父之利|어부지리|둘이 다투는 사이에 제삼자가 이익을 봄
+言語道斷|언어도단|말문이 막힐 만큼 어이없음
+言行一致|언행일치|말과 행동이 같음
+言中有骨|언중유골|예사로운 말 속에 깊은 뜻이 있음
+如履薄氷|여리박빙|얇은 얼음을 밟는 것처럼 몹시 위험함
+易地思之|역지사지|처지를 바꾸어 생각함
+緣木求魚|연목구어|나무에 올라 물고기를 구함: 불가능한 일을 하려 함
+五里霧中|오리무중|짙은 안개 속: 갈피를 잡을 수 없음
+烏飛梨落|오비이락|우연히 일이 겹쳐 의심을 받음
+吾鼻三尺|오비삼척|내 코가 석 자: 내 사정이 급해 남을 돌볼 겨를이 없음
+吳越同舟|오월동주|원수끼리도 위기에서는 서로 돕게 됨
+傲霜孤節|오상고절|서리에도 굽히지 않는 외로운 절개
+烏合之卒|오합지졸|질서 없이 모인 무리
+溫故知新|온고지신|옛것을 익히고 새것을 앎
+臥薪嘗膽|와신상담|원수를 갚으려고 고난을 참고 견딤
+外柔內剛|외유내강|겉은 부드럽고 속은 단단함
+樂山樂水|요산요수|산과 물을 좋아함
+龍頭蛇尾|용두사미|시작은 거창하나 끝은 보잘것없음
+龍蛇飛騰|용사비등|살아 움직이는 듯한 힘찬 필치
+牛耳讀經|우이독경|소 귀에 경 읽기: 말해도 알아듣지 못함
+優柔不斷|우유부단|어물어물 결단력이 없음
+雨後竹筍|우후죽순|비 온 뒤 죽순처럼 많이 생겨남
+遠交近攻|원교근공|먼 나라와 사귀고 가까운 나라를 침
+遠禍召福|원화소복|화를 물리치고 복을 불러들임
+月下氷人|월하빙인|혼인을 중매하는 사람
+類類相從|유유상종|같은 무리끼리 서로 사귐
+有口無言|유구무언|입이 있어도 말할 수 없음: 변명할 말이 없음
+有名無實|유명무실|이름만 있고 실속이 없음
+有備無患|유비무환|미리 준비하면 걱정이 없음
+唯我獨尊|유아독존|세상에서 내가 가장 존귀함
+悠悠自適|유유자적|속세를 떠나 마음 편히 삶
+隱忍自重|은인자중|마음속에 감추고 참으며 몸가짐을 신중히 함
+意氣揚揚|의기양양|뜻을 이루어 기운차고 자랑스러운 모양
+意氣投合|의기투합|서로 마음이 맞음
+意氣消沈|의기소침|기운이 없어지고 풀이 죽음
+異口同聲|이구동성|여러 사람의 말이 한결같음
+以卵擊石|이란격석|계란으로 바위 치기: 도저히 이길 수 없음
+理路整然|이로정연|이야기의 갈피가 질서 있게 정돈됨
+以實直告|이실직고|사실 그대로 고함
+以心傳心|이심전심|말하지 않아도 마음으로 서로 통함
+二律背反|이율배반|서로 모순되는 두 명제가 함께 성립함
+以熱治熱|이열치열|열은 열로써 다스림
+利用厚生|이용후생|기구를 편리하게 쓰고 생활을 넉넉하게 함
+耳目口鼻|이목구비|귀·눈·입·코: 얼굴의 생김새
+因果應報|인과응보|행한 대로 결과를 받음
+人面獸心|인면수심|얼굴은 사람이나 마음은 짐승 같음
+人山人海|인산인해|사람이 산과 바다를 이룸: 사람이 매우 많이 모임
+人事不省|인사불성|정신을 잃어 의식이 없음
+人生無常|인생무상|인생이 덧없음
+人之常情|인지상정|사람이면 누구나 가지는 보통 감정
+一刻三秋|일각삼추|아주 짧은 시간이 삼 년같이 길게 느껴짐
+一擧兩得|일거양득|한 가지 일로 두 가지 이익을 얻음
+一網打盡|일망타진|한꺼번에 모조리 잡음
+一問一答|일문일답|한 번 묻고 한 번 답함
+一目瞭然|일목요연|한 번 보고도 분명히 알 수 있음
+一石二鳥|일석이조|한 가지 일로 두 가지 이득을 얻음
+一魚濁水|일어탁수|한 사람의 잘못으로 여러 사람이 피해를 입음
+一言半句|일언반구|아주 짧은 말
+一以貫之|일이관지|하나의 이치로 모든 것을 꿰뚫음
+一日三秋|일일삼추|하루가 삼 년같이 길게 느껴짐: 몹시 애타게 기다림
+一長一短|일장일단|좋은 점도 있고 나쁜 점도 있음
+一場春夢|일장춘몽|한바탕의 봄꿈: 덧없는 인생
+一進一退|일진일퇴|나아갔다 물러났다 함
+一敗塗地|일패도지|한 번 패하여 다시 일어나지 못함
+一片丹心|일편단심|변치 않는 참된 마음
+一寸光陰|일촌광음|매우 짧은 시간
+一觸卽發|일촉즉발|조금만 건드려도 폭발할 것 같은 위기
+一心同體|일심동체|한마음 한몸: 서로 굳게 결합함
+一喜一悲|일희일비|기쁨과 슬픔이 번갈아 일어남
+日就月將|일취월장|나날이 달마다 발전함
+日月星辰|일월성신|해와 달과 별
+自家撞着|자가당착|자기 말이나 행동이 앞뒤가 맞지 않음
+自强不息|자강불식|스스로 힘쓰며 쉬지 않음
+自給自足|자급자족|필요한 것을 스스로 마련함
+自繩自縛|자승자박|자기가 만든 줄로 자기를 묶음
+自業自得|자업자득|자기가 한 일의 결과를 자기가 받음
+自初至終|자초지종|처음부터 끝까지의 과정
+自畵自讚|자화자찬|자기가 한 일을 스스로 칭찬함
+作心三日|작심삼일|결심이 사흘을 가지 못함
+長幼有序|장유유서|어른과 아이 사이에는 차례가 있음
+張三李四|장삼이사|평범한 보통 사람들
+賊反荷杖|적반하장|도둑이 도리어 매를 듦: 잘못한 사람이 오히려 큰소리침
+赤手空拳|적수공권|맨손과 맨주먹: 아무것도 없음
+適者生存|적자생존|환경에 적응한 것만 살아남음
+轉禍爲福|전화위복|재앙이 바뀌어 복이 됨
+前代未聞|전대미문|지난 시대에는 들어 본 적 없음
+前虎後狼|전호후랑|앞문의 호랑이 뒷문의 이리: 재앙이 계속 닥침
+切磋琢磨|절차탁마|학문과 덕행을 갈고닦음
+漸入佳境|점입가경|갈수록 경치나 일이 흥미로워짐
+頂門一鍼|정문일침|따끔한 충고
+正正堂堂|정정당당|태도나 수단이 바르고 떳떳함
+糟糠之妻|조강지처|가난할 때 고생을 함께한 아내
+朝令暮改|조령모개|법령을 자주 고쳐 갈피를 잡을 수 없음
+朝變夕改|조변석개|계획이나 결정을 자주 바꿈
+朝三暮四|조삼모사|눈앞의 이익만 알고 결과는 모름, 잔꾀로 남을 속임
+左顧右眄|좌고우면|이쪽저쪽을 돌아보며 망설임
+坐不安席|좌불안석|마음이 불안하여 한곳에 앉아 있지 못함
+左之右之|좌지우지|제 마음대로 다룸
+走馬看山|주마간산|달리는 말 위에서 산을 봄: 대충대충 훑어봄
+走馬加鞭|주마가편|달리는 말에 채찍질: 잘하는 사람을 더욱 격려함
+晝耕夜讀|주경야독|낮에는 농사 짓고 밤에는 공부함
+晝夜長川|주야장천|밤낮으로 쉬지 않고 계속함
+竹馬故友|죽마고우|어릴 때부터 같이 놀며 자란 벗
+衆口難防|중구난방|많은 사람의 말을 막기 어려움
+重言復言|중언부언|이미 한 말을 되풀이함
+指鹿爲馬|지록위마|윗사람을 속이고 권세를 마음대로 함
+知彼知己|지피지기|적과 나를 앎
+至誠感天|지성감천|지극한 정성은 하늘도 감동시킴
+知行合一|지행합일|지식과 행동이 일치함
+進退兩難|진퇴양난|나아가기도 물러서기도 어려움
+進退維谷|진퇴유곡|궁지에 몰려 꼼짝할 수 없음
+此日彼日|차일피일|오늘내일 하며 자꾸 기한을 미룸
+滄海一粟|창해일속|넓은 바다의 좁쌀 한 알: 아주 보잘것없는 존재
+千變萬化|천변만화|끝없이 변화함
+千辛萬苦|천신만고|온갖 어려움과 고생
+天高馬肥|천고마비|하늘은 높고 말은 살찜: 가을을 이르는 말
+天衣無縫|천의무봉|꾸밈없이 자연스러워 흠이 없음
+千篇一律|천편일률|여럿이 모두 비슷비슷함
+千載一遇|천재일우|천 년에 한 번 만날 만한 좋은 기회
+千差萬別|천차만별|여러 가지 사물이 서로 다르고 차이가 많음
+千萬多幸|천만다행|매우 다행함
+天佑神助|천우신조|하늘과 신령의 도움
+天地神明|천지신명|하늘과 땅의 모든 신령
+天下泰平|천하태평|세상이 태평함: 아무 근심 없이 편안함
+天眞爛漫|천진난만|꾸밈없이 순진하고 명랑함
+靑山流水|청산유수|막힘없이 말을 잘함
+靑天白日|청천백일|맑게 갠 대낮: 죄가 없음이 밝혀짐
+靑出於藍|청출어람|제자가 스승보다 나음
+草綠同色|초록동색|처지가 같은 것끼리 어울림
+初志一貫|초지일관|처음 세운 뜻을 끝까지 밀고 나감
+寸鐵殺人|촌철살인|짧은 말로 핵심을 찔러 감동시킴
+忠言逆耳|충언역이|바른 말은 귀에 거슬림
+醉生夢死|취생몽사|아무 뜻 없이 흐리멍덩하게 삶
+針小棒大|침소봉대|작은 일을 크게 부풀려 말함
+快刀亂麻|쾌도난마|어지러운 일을 명쾌하게 처리함
+他山之石|타산지석|다른 사람의 하찮은 언행도 자기 수양에 도움이 됨
+卓上空論|탁상공론|실현성 없는 헛된 논의
+貪官汚吏|탐관오리|탐욕스럽고 부정한 관리
+泰山北斗|태산북두|그 분야에서 가장 존경받는 사람
+泰然自若|태연자약|어떤 일에도 태연하고 침착함
+兎死狗烹|토사구팽|쓸모가 없어지면 버림받음
+土崩瓦解|토붕와해|흙이 무너지고 기와가 깨짐: 조직이 걷잡을 수 없이 무너짐
+破邪顯正|파사현정|그릇된 것을 깨고 바른 것을 드러냄
+破竹之勢|파죽지세|대나무를 쪼개는 듯한 맹렬한 기세
+八方美人|팔방미인|여러 방면에 능통한 사람, 누구에게나 호감을 사려는 사람
+敗軍之將|패군지장|싸움에 진 장수
+風前燈火|풍전등화|바람 앞의 등불: 매우 위태로운 처지
+風餐露宿|풍찬노숙|바람 먹고 이슬에 잠: 고생스러운 객지 생활
+匹夫之勇|필부지용|깊은 생각 없이 혈기로만 부리는 용기
+必死卽生|필사즉생|죽기를 각오하고 싸우면 살아남
+下石上臺|하석상대|아랫돌 빼서 윗돌 괴기: 임시변통
+鶴首苦待|학수고대|목을 빼고 몹시 기다림
+咸興差使|함흥차사|심부름 가서 돌아오지 않거나 소식이 없음
+虛張聲勢|허장성세|실속 없이 큰소리치며 허세만 부림
+懸頭刺股|현두자고|머리를 매달고 허벅지를 찌름: 열심히 공부함
+螢雪之功|형설지공|고생하며 공부한 보람
+狐假虎威|호가호위|남의 권세를 빌려 위세를 부림
+好事多魔|호사다마|좋은 일에는 방해되는 일이 많음
+虎視眈眈|호시탐탐|노려보며 기회를 엿봄
+浩然之氣|호연지기|하늘과 땅 사이에 가득 찬 넓고 큰 기운
+昏定晨省|혼정신성|저녁에는 잠자리를 보살피고 아침에는 문안을 드림
+弘益人間|홍익인간|널리 인간 세상을 이롭게 함
+畵龍點睛|화룡점정|가장 중요한 부분을 완성함
+畵蛇添足|화사첨족|쓸데없는 것을 덧붙여 도리어 일을 그르침
+花容月態|화용월태|꽃같이 고운 얼굴과 달같이 아름다운 몸매
+花朝月夕|화조월석|꽃 피는 아침과 달 밝은 저녁: 경치 좋은 때
+換骨奪胎|환골탈태|용모가 몰라보게 아름다워짐, 남의 글을 고쳐 새롭게 만듦
+會者定離|회자정리|만난 사람은 반드시 헤어짐
+興盡悲來|흥진비래|즐거운 일이 다하면 슬픈 일이 옴
+興亡盛衰|흥망성쇠|흥하고 망하고 성하고 쇠함
+喜怒哀樂|희로애락|기쁨과 노여움과 슬픔과 즐거움
+兵家常事|병가상사|싸움에 이기고 지는 것은 흔한 일: 실패는 흔히 있는 일
+本末顚倒|본말전도|일의 중요한 것과 덜 중요한 것이 뒤바뀜
+先後本末|선후본말|먼저와 나중, 근본과 끝
+首尾相應|수미상응|처음과 끝이 서로 맞음
+面從腹背|면종복배|겉으로는 복종하는 체하고 속으로는 배반함
+白衣民族|백의민족|흰옷을 입는 민족: 한민족을 이르는 말
+父子有親|부자유친|아버지와 아들 사이에는 친애가 있어야 함
+夫婦有別|부부유별|부부 사이에는 구별이 있음
+朋友有信|붕우유신|친구 사이에는 믿음이 있어야 함
+見利思義|견리사의|이익을 보면 의로운지 먼저 생각함
+見利忘義|견리망의|이익을 보면 의리를 저버림
+苛斂誅求|가렴주구|세금을 가혹하게 거두고 재물을 빼앗음
+甘井先竭|감정선갈|물맛 좋은 우물이 먼저 마름: 재주 있는 사람이 먼저 쇠함
+以身作則|이신작칙|자신이 먼저 본보기가 됨
+小貪大失|소탐대실|작은 것을 탐내다 큰 것을 잃음
+事實無根|사실무근|사실에 근거가 없음
+敬老孝親|경로효친|노인을 공경하고 부모에게 효도함
+兄友弟恭|형우제공|형은 아우를 사랑하고 아우는 형을 공경함
+三從之道|삼종지도|여자가 따라야 할 세 가지 도리
+天地開闢|천지개벽|하늘과 땅이 처음 열림: 세상이 크게 변함
+天人共怒|천인공노|하늘과 사람이 함께 노할 만큼 나쁨
+天生緣分|천생연분|하늘이 맺어 준 인연
+水火相剋|수화상극|물과 불처럼 서로 맞서 해침
+海枯石爛|해고석란|바다가 마르고 돌이 썩음: 아주 오랜 세월이 지나도 변치 않음
+草木皆兵|초목개병|풀과 나무도 모두 적병으로 보임: 몹시 놀라 의심함
+堂狗風月|당구풍월|서당 개 삼 년이면 풍월을 읊음: 오래 보고 들으면 익힘
+後生可畏|후생가외|젊은 후배는 두려워할 만함
+前途有望|전도유망|앞으로 잘될 가망이 있음
+前人未踏|전인미답|아직 아무도 발을 들여놓지 못함
+無事安逸|무사안일|큰 탈 없이 편안히 지냄: 일을 소극적으로 처리함
+無事泰平|무사태평|아무 탈 없이 마음이 편안함
+無知莫知|무지막지|몹시 무식하고 상스러우며 난폭함
+無念無想|무념무상|아무 생각이 없는 상태
+有始有終|유시유종|처음부터 끝까지 한결같음
+自問自答|자문자답|스스로 묻고 스스로 대답함
+自手成家|자수성가|물려받은 재산 없이 스스로 집안을 일으킴
+自中之亂|자중지란|같은 편끼리의 싸움
+自暴自棄|자포자기|스스로 자신을 포기하고 돌보지 않음
+自由自在|자유자재|거침없이 마음대로 함
+自力更生|자력갱생|자기 힘으로 일을 해 나감
+自古以來|자고이래|옛날부터 지금까지
+長生不死|장생불사|오래 살고 죽지 않음
+利害得失|이해득실|이익과 손해, 얻음과 잃음
+先憂後樂|선우후락|근심은 남보다 먼저, 즐거움은 남보다 나중에
+生年月日|생년월일|태어난 해와 달과 날
+生者必滅|생자필멸|살아 있는 것은 반드시 죽음
+不老長生|불로장생|늙지 않고 오래 삶
+不老不死|불로불사|늙지도 죽지도 않음
+不可思議|불가사의|이해할 수 없는 신기한 일
+不可抗力|불가항력|힘으로 어찌할 수 없는 일
+不知其數|부지기수|그 수를 알 수 없을 만큼 많음
+不遠千里|불원천리|천 리 길도 멀다 하지 않음
+不立文字|불립문자|말이나 글로는 전할 수 없음
+不眠不休|불면불휴|자지도 쉬지도 않음
+氷肌玉骨|빙기옥골|아름다운 살결과 뼈대: 매화 또는 미인
+事事件件|사사건건|모든 일마다
+死生決斷|사생결단|죽고 사는 것을 가리지 않고 끝장을 냄
+死而後已|사이후이|죽은 뒤에야 그만둠: 평생 힘씀
+四海兄弟|사해형제|온 세상 사람이 모두 형제
+四苦八苦|사고팔고|온갖 괴로움
+三寒四溫|삼한사온|사흘 춥고 나흘 따뜻함
+三日天下|삼일천하|권세를 잡았다가 곧 쫓겨남
+上行下效|상행하효|윗사람이 하면 아랫사람이 본받음
+相扶相助|상부상조|서로서로 도움
+傷弓之鳥|상궁지조|화살에 다친 새: 한 번 혼난 뒤 몹시 겁을 냄
+率先垂範|솔선수범|앞장서서 모범을 보임
+手舞足蹈|수무족도|매우 기뻐서 날뜀
+首鼠兩端|수서양단|거취를 정하지 못하고 망설임
+隨機應變|수기응변|그때그때 형편에 맞게 처리함
+十年知己|십년지기|오래전부터 친하게 사귄 친구
+十常八九|십상팔구|열에 여덟아홉: 거의 틀림없음
+十日之菊|십일지국|때가 지나 쓸모없게 된 것
+深山幽谷|심산유곡|깊은 산속의 으슥한 골짜기
+深謀遠慮|심모원려|깊은 꾀와 먼 앞날을 내다보는 생각
+心機一轉|심기일전|어떤 계기로 마음을 완전히 바꿈
+心心相印|심심상인|말없이 마음과 마음으로 뜻이 통함
+阿鼻叫喚|아비규환|여러 사람이 비참한 지경에 빠져 울부짖는 상황
+惡戰苦鬪|악전고투|매우 어렵고 괴로운 싸움
+惡因惡果|악인악과|나쁜 일을 하면 나쁜 결과를 얻음
+安分知足|안분지족|자기 분수를 지키며 만족할 줄 앎
+眼高手低|안고수저|눈은 높으나 솜씨는 서투름
+藥房甘草|약방감초|어떤 일에나 빠짐없이 끼어듦
+養虎遺患|양호유환|호랑이를 길러 근심을 남김: 화근을 키움
+魚魯不辨|어로불변|어(魚) 자와 노(魯) 자를 구별하지 못함: 매우 무식함
+魚水之親|어수지친|물고기와 물처럼 친밀한 사이
+與民同樂|여민동락|백성과 함께 즐김
+如出一口|여출일구|한 입에서 나오는 것 같음: 여러 사람의 말이 같음
+烏鳥私情|오조사정|부모를 봉양하는 효성
+玉石俱焚|옥석구분|옥과 돌이 함께 탐: 좋은 것과 나쁜 것이 함께 망함
+外親內疎|외친내소|겉으로는 친한 척하나 속으로는 멀리함
+龍虎相搏|용호상박|강자끼리 서로 싸움
+愚公移山|우공이산|우직하게 한 가지 일을 계속하면 결국 이룸
+雨順風調|우순풍조|비와 바람이 알맞게 와서 농사에 좋음
+遠水近火|원수근화|먼 데 있는 물은 가까운 불을 끄지 못함
+流芳百世|유방백세|꽃다운 이름이 후세에 길이 전함
+流言蜚語|유언비어|근거 없이 떠도는 소문
+柔能制剛|유능제강|부드러운 것이 능히 강한 것을 이김
+以德報怨|이덕보원|원수를 덕으로 갚음
+以夷制夷|이이제이|적을 이용해 적을 막음
+一葉知秋|일엽지추|작은 징조로 큰 흐름을 앎
+一葉片舟|일엽편주|조그마한 조각배
+一衣帶水|일의대수|한 줄기 띠 같은 좁은 강: 매우 가까운 사이
+一絲不亂|일사불란|질서가 정연하여 조금도 어지러움이 없음
+一瀉千里|일사천리|일이 거침없이 빨리 진행됨
+一脈相通|일맥상통|생각이나 성질이 서로 통함
+一刀兩斷|일도양단|어떤 일을 머뭇거리지 않고 단호히 결정함
+一騎當千|일기당천|한 사람이 천 명을 당해 낼 만큼 힘이 셈
+一朝一夕|일조일석|짧은 시일
+一知半解|일지반해|하나쯤 알고 반쯤 이해함: 어설픈 지식
+一筆揮之|일필휘지|단숨에 글씨나 그림을 써 내림
+日進月步|일진월보|날로 달로 계속 발전함
+日新月異|일신월이|나날이 새로워지고 다달이 달라짐
+臨機應變|임기응변|그때그때 일어나는 사정에 맞게 처리함
+臨戰無退|임전무퇴|싸움에 임하여 물러서지 않음
+入鄕循俗|입향순속|그 지방에 가면 그곳 풍속을 따름
+立身揚名|입신양명|출세하여 이름을 세상에 떨침
+立身出世|입신출세|사회적으로 높은 자리에 오름
+才色兼備|재색겸비|재주와 미모를 함께 갖춤
+才勝薄德|재승박덕|재주는 뛰어나나 덕이 부족함
+適材適所|적재적소|알맞은 인재를 알맞은 자리에 씀
+電光石火|전광석화|매우 짧은 시간이나 재빠른 동작
+戰戰兢兢|전전긍긍|몹시 두려워 벌벌 떨며 조심함
+輾轉反側|전전반측|몸을 이리저리 뒤척이며 잠을 이루지 못함
+全知全能|전지전능|모든 것을 알고 무엇이든 할 수 있음
+切齒腐心|절치부심|몹시 분하여 이를 갈며 벼름
+左衝右突|좌충우돌|이리저리 닥치는 대로 부딪침
+主客顚倒|주객전도|주인과 손님의 위치가 뒤바뀜
+酒池肉林|주지육림|호화스러운 술잔치
+竹杖芒鞋|죽장망혜|간편한 나그네 차림
+衆寡不敵|중과부적|적은 수로는 많은 수를 대적하지 못함
+支離滅裂|지리멸렬|이리저리 흩어져 갈피를 잡을 수 없음
+盡忠報國|진충보국|충성을 다하여 나라의 은혜에 보답함
+天災地變|천재지변|자연 현상으로 일어나는 재앙
+徹頭徹尾|철두철미|처음부터 끝까지 빈틈이 없음
+靑雲之志|청운지지|높은 벼슬에 오르려는 큰 뜻
+淸廉潔白|청렴결백|마음이 맑고 깨끗하며 재물 욕심이 없음
+秋風落葉|추풍낙엽|세력이 갑자기 쇠퇴함
+出將入相|출장입상|문무를 겸비한 사람
+七顚八起|칠전팔기|실패해도 굴하지 않고 다시 일어남
+太平聖代|태평성대|어질고 착한 임금이 다스리는 태평한 세상
+破顔大笑|파안대소|얼굴이 활짝 펴지도록 크게 웃음
+八面六臂|팔면육비|여러 방면에서 능숙하게 일을 처리함
+平地風波|평지풍파|평온한 곳에서 일어나는 분쟁
+抱腹絶倒|포복절도|배를 안고 넘어질 만큼 몹시 웃음
+暴虎馮河|포호빙하|무모한 용기를 부림
+風樹之嘆|풍수지탄|부모가 돌아가셔서 효도할 수 없는 슬픔
+皮骨相接|피골상접|살가죽과 뼈가 맞닿을 정도로 몹시 야윔
+下學上達|하학상달|낮은 데서 배워 높은 이치에 통달함
+行雲流水|행운유수|떠가는 구름과 흐르는 물처럼 자연스러움
+虛心坦懷|허심탄회|마음속에 거리낌 없이 솔직함
+虛無孟浪|허무맹랑|터무니없이 거짓되고 실속이 없음
+賢母良妻|현모양처|어진 어머니이자 착한 아내
+懸河雄辯|현하웅변|흐르는 물처럼 거침없이 잘하는 말솜씨
+好衣好食|호의호식|좋은 옷을 입고 좋은 음식을 먹음: 잘 삶
+惑世誣民|혹세무민|세상 사람을 속여 어지럽힘
+禍不單行|화불단행|불행은 연달아 옴
+荒唐無稽|황당무계|말이나 행동이 터무니없고 근거가 없음
+後悔莫及|후회막급|아무리 후회해도 소용없음
+厚顔無恥|후안무치|얼굴이 두꺼워 부끄러움을 모름
+興味津津|흥미진진|흥미가 넘쳐 흐름
+喜喜樂樂|희희낙락|매우 기뻐하고 즐거워함
+喜色滿面|희색만면|기쁜 빛이 얼굴에 가득함
+角者無齒|각자무치|한 사람이 모든 복을 다 가질 수는 없음
+"""
+
+
+@st.cache_resource(show_spinner=False)
+def idiom_db():
+    """내장 사전 -> [{hanja, sound, meaning, group}] (4글자 사자성어)"""
+    items, _problems, _dup = build_idioms(parse_idiom_text(IDIOM_DB_TEXT))
+    return items
+
+
+def word_chars():
+    """단어장에 들어 있는 모든 한자(글자) 집합"""
+    return {c for w in st.session_state.words for c in w["hanja"] if has_hanja(c)}
+
+
+def match_idioms(chars):
+    """내 한자로만 이루어진 사자성어"""
+    return [dict(x) for x in idiom_db() if all(c in chars for c in x["hanja"])]
+
+
+def near_idioms(chars):
+    """딱 한 글자만 모르는 사자성어 -> [(사자성어, 모르는 한자)]"""
+    out = []
+    for x in idiom_db():
+        miss = {c for c in x["hanja"] if c not in chars}
+        if len(miss) == 1:
+            out.append((x, next(iter(miss))))
+    return out
+
+
+def refresh_idioms():
+    """단어장이 바뀌었을 때만 사자성어 목록을 다시 골라요 (내 한자 → 사자성어 자동 연결)"""
+    s = st.session_state
+    sig = "".join(sorted(word_chars()))
+    if s.get("idiom_sig") != sig or not isinstance(s.idioms, list):
+        s.idioms = match_idioms(set(sig))
+        s.idiom_sig = sig
+        reset_idiom_quiz()  # 목록이 바뀌었으니 진행 중이던 사자성어 시험은 비워요
+
+
+# ----------------------------------------------------------------------
+# 사자성어 (목록 · 시험 · 오답 노트) — 한자 통계와 섞지 않고 따로 저장해요
 # ----------------------------------------------------------------------
 def check_idiom_reading(user, it):
     """독음 채점: 띄어쓰기·'/' 등은 무시하고, '/'로 이은 여러 답 중 하나면 정답"""
@@ -3041,26 +3582,52 @@ def idiom_char_pool():
 
 
 def idiom_choices(it, field, n=4, avoid_sound=False):
-    """보기 만들기: 같은 분류·같은 글자 수의 다른 사자성어를 먼저 오답 보기로 써요"""
+    """보기 만들기. 뜻은 사전의 다른 사자성어 뜻을, 사자성어(한자)는 내 목록의 다른 사자성어를 먼저 쓰고,
+    모자라면 한 글자를 바꾼 '가짜' 사자성어로 채워요 (실제 사자성어와 겹치지 않게)"""
     s = st.session_state
-    key = (lambda x: norm(x["meaning"])) if field == "meaning" else (lambda x: x["hanja"])
-    others = [x for x in s.idioms if x["hanja"] != it["hanja"]]
+    me = it["hanja"]
+    if field == "meaning":
+        mine = [x for x in s.idioms if x["hanja"] != me]
+        rest = [x for x in idiom_db() if x["hanja"] != me]
+        random.shuffle(mine)
+        random.shuffle(rest)
+        seen, pick = {norm(it["meaning"])}, []
+        for x in mine + rest:
+            k = norm(x["meaning"])
+            if k in seen:
+                continue
+            seen.add(k)
+            pick.append(x)
+            if len(pick) == n - 1:
+                break
+        opts = [{"key": x["hanja"], "text": x["meaning"]} for x in pick] + [{"key": me, "text": it["meaning"]}]
+        random.shuffle(opts)
+        return opts
+    others = [x for x in s.idioms if x["hanja"] != me]
     if avoid_sound:  # 독음이 같은 다른 사자성어는 정답 시비가 생겨서 제외
         others = [x for x in others if norm(x["sound"]) != norm(it["sound"])]
     random.shuffle(others)
-    grp, ln = it.get("group"), len(it["hanja"])
-    others.sort(key=lambda x: (0 if grp and x.get("group") == grp else 1, 0 if len(x["hanja"]) == ln else 1))
-    seen, pick = {key(it)}, []
+    texts, seen = [], {me}
     for x in others:
-        if key(x) in seen:
+        if x["hanja"] not in seen:
+            seen.add(x["hanja"])
+            texts.append(x["hanja"])
+            if len(texts) == n - 1:
+                break
+    chars = sorted(idiom_char_pool())
+    real = {x["hanja"] for x in idiom_db()}
+    tries = 0
+    while len(texts) < n - 1 and tries < 300 and len(chars) >= 2:
+        tries += 1
+        pos, c = random.randrange(len(me)), random.choice(chars)
+        fake = me[:pos] + c + me[pos + 1:]
+        if c == me[pos] or fake in seen or fake in real:
             continue
-        seen.add(key(x))
-        pick.append(x)
-        if len(pick) == n - 1:
-            break
-    opts = pick + [it]
+        seen.add(fake)
+        texts.append(fake)
+    opts = [{"key": t, "text": t} for t in texts] + [{"key": me, "text": me}]
     random.shuffle(opts)
-    return [{"key": x["hanja"], "text": x[field]} for x in opts]
+    return opts
 
 
 def blank_choices(it, bi, cpool=None, n=4):
@@ -3092,9 +3659,9 @@ def make_idiom_item(it, ty, cpool=None):
 
 def idiom_kinds_avail():
     """(고르기 가능, 빈칸 고르기 가능, 빈칸 손글씨 가능)"""
-    n = len(st.session_state.idioms)
-    choice_ok = n >= 4
-    blank_ok = choice_ok and len(idiom_char_pool()) >= 10
+    n, pool = len(st.session_state.idioms), len(idiom_char_pool())
+    choice_ok = n >= 1 and pool >= 5
+    blank_ok = choice_ok and pool >= 10
     hw_ok = bool(HAS_CANVAS and find_font())
     return choice_ok, blank_ok, hw_ok
 
@@ -3144,18 +3711,7 @@ def record_idiom(q, ok, ans, retry=False):
     return {"q": q, "correct": bool(ok), "answer": str(ans)}
 
 
-def record_external(w, qtype, ok, ans, retry=False):
-    """기존 record()를 재사용하되, 연습 중인 퀴즈의 결과 목록(s.results)은 건드리지 않게 감싸요 (모의고사용)"""
-    s = st.session_state
-    keep, keep_retry = s.results, s.retry_mode
-    s.results, s.retry_mode = [], bool(retry)
-    try:
-        record(w, qtype, ok, ans)
-    finally:
-        s.results, s.retry_mode = keep, keep_retry
-
-
-# --- 손글씨 공통 (모의고사·사자성어 빈칸용; 연습 탭의 render_write는 그대로 둬요) -------
+# --- 손글씨 공통 (사자성어 빈칸용; 연습 탭의 render_write는 그대로 둬요) -------
 def canvas_backdrop_for(box_key, img, px):
     """canvas_backdrop 과 같지만 칸 이름(box_key)을 따로 받아서, 여러 화면의 캔버스가 서로 겹치지 않게 해요"""
     buf = io.BytesIO()
@@ -3195,7 +3751,7 @@ def hw_clear():
     st.session_state.hw_clear += 1
 
 
-# --- 문제 그리기 (사자성어 시험 · 모의고사 공용) -------------------------------------
+# --- 문제 그리기 (사자성어 시험) -------------------------------------
 def idiom_card(text):
     n = max(1, len(text))
     size = 64 if n <= 4 else 50 if n <= 6 else 40
@@ -3236,7 +3792,7 @@ def render_idiom_q(q, scope, answer_fn, pos, nonce):
         clue = f"뜻: {esc(it['meaning'])}" + (f" · 독음: {esc(ms)}" if ms else "")
     if ty == "i_hw":
         px, font = canvas_px(), find_font()
-        left, right = st.columns(2)
+        left, right = st.columns([3, 2])
         with left:
             idiom_card(blank_text(it["hanja"], bi))
             html(f"<div class='ask'>{clue}<br>□에 들어갈 한자를 오른쪽 칸에 쓰세요</div>")
@@ -3279,21 +3835,21 @@ def render_idiom_q(q, scope, answer_fn, pos, nonce):
 
 
 # --- 사자성어 시험 ---------------------------------------------------------------------
-def idiom_pool_for(src, groups):
+def idiom_pool_for(src):
     s = st.session_state
     if src == "오답 노트만":
         return [{"hanja": v["hanja"], "sound": v["sound"], "meaning": v["meaning"], "group": ""}
                 for v in s.idiom_wrong.values() if v.get("sound") and v.get("meaning")]
-    return [dict(x) for x in s.idioms if not (src == "분류 선택" and groups) or x.get("group") in groups]
+    return [dict(x) for x in s.idioms]
 
 
 def start_idiom_quiz():
     s = st.session_state
     src, kind = s.get("idm_src", "전체"), s.get("idm_type", "섞어서")
-    pool = idiom_pool_for(src, s.get("idm_groups", []))
+    pool = idiom_pool_for(src)
     if not pool:
         s.flash = ("오답 노트에 사자성어가 없어요. 🎉" if src == "오답 노트만"
-                   else "문제로 만들 사자성어가 없어요. '관리'에서 먼저 추가해 주세요.")
+                   else "내 한자로 만들 수 있는 사자성어가 아직 없어요.")
         return
     types = idiom_types_for(kind)
     if not types:
@@ -3325,20 +3881,14 @@ def idiom_retry_wrong():
         s.iquiz, s.iretry = items, False
 
 
-def go_idiom_manage():
-    st.session_state.idm_view = "관리"
-
-
 def render_idiom_setup():
     s = st.session_state
     n = len(s.idioms)
     st.subheader("사자성어 시험")
-    st.caption(f"사자성어 {n}개 · 한자 시험과 따로 기록해요. 정답은 끝난 뒤에 보여줘요.")
+    st.caption(f"내 한자로 만든 사자성어 {n}개에서 나와요 · 한자 시험과 따로 기록해요. 정답은 끝난 뒤에 보여줘요.")
     av = idiom_kinds_avail()
     kinds = [k for k in IDIOM_KINDS if idiom_types_for(k, av)]
-    if n < 4:
-        st.info("사자성어가 4개 미만이라 '고르기·빈칸' 유형은 쓸 수 없어요. 4개 이상 담으면 열려요. (지금은 독음 쓰기만 가능해요)")
-    elif "빈칸 손글씨" not in kinds:
+    if n and av[0] and "빈칸 손글씨" not in kinds:
         st.caption("'빈칸 손글씨'는 손글씨 기능과 한자 폰트가 있어야 해요. (지금은 빠져 있어요)")
     if s.get("idm_type") not in kinds:
         s.idm_type = kinds[0]
@@ -3346,13 +3896,6 @@ def render_idiom_setup():
     if s.get("idm_src") not in IDIOM_SRC:
         s.idm_src = IDIOM_SRC[0]
     st.radio("범위", IDIOM_SRC, key="idm_src", horizontal=True)
-    if s.idm_src == "분류 선택":
-        groups = sorted({x["group"] for x in s.idioms if x.get("group")})
-        if groups:
-            s.idm_groups = [g for g in s.get("idm_groups", []) if g in groups]
-            st.multiselect("분류 (비워 두면 전체)", groups, key="idm_groups", placeholder="전체 (눌러서 고르기)")
-        else:
-            st.caption("분류가 적힌 사자성어가 없어서 전체에서 나와요.")
     st.slider("문제 수", 5, 50, step=5, key="idm_count")
     st.button("▶️ 시작하기", type="primary", on_click=start_idiom_quiz, width="stretch", key="idm_start")
 
@@ -3385,8 +3928,8 @@ def render_idiom_result():
 def render_idiom_exam():
     s = st.session_state
     if not s.idioms:
-        st.info("아직 사자성어가 없어요. '관리'에서 추가하거나 내장 세트를 불러와 주세요.")
-        st.button("🛠 관리로 가기", on_click=go_idiom_manage, key="idm_go_manage")
+        st.info("지금 단어장의 한자만으로 만들 수 있는 사자성어가 아직 없어요. 한자를 더 불러오면 자동으로 늘어나요.")
+        st.button("📜 목록 보기", on_click=go_idiom_list, key="idm_go_list")
         return
     if not s.iquiz:
         render_idiom_setup()
@@ -3439,675 +3982,66 @@ def render_idiom_wrong():
     st.caption("오답 노트 범위에서 맞히면 노트에서 자동으로 빠져요.")
 
 
-# --- 사자성어 관리 ---------------------------------------------------------------------
-IDIOM_COLS = ["사자성어", "독음", "뜻", "분류"]
+# --- 사자성어 목록 (내 한자로 만든 것) ----------------------------------------------------
+def go_idiom_list():
+    st.session_state.idm_view = "목록"
 
 
-def idioms_df(lst):
-    return pd.DataFrame([{"사자성어": x["hanja"], "독음": x["sound"], "뜻": x["meaning"], "분류": x.get("group", "")}
-                         for x in lst], columns=IDIOM_COLS)
+def _idiom_row(x, miss=None):
+    h = esc(x["hanja"])
+    if miss:
+        h = h.replace(esc(miss), f"<b class='miss'>{esc(miss)}</b>")
+    return (f"<div class='idm'><span class='idm-h'>{h}</span> <span class='idm-s'>{esc(x['sound'])}</span>"
+            f"<div class='idm-m'>{esc(x['meaning'])}</div></div>")
 
 
-def idioms_csv(lst):
-    return idioms_df(lst).to_csv(index=False).encode("utf-8-sig")
-
-
-def idioms_from_df(df):
-    out, errors, seen = [], [], {}
-    for i, (_, r) in enumerate(df.iterrows(), 1):
-        h = re.sub(r"\s+", "", _cell(r.get("사자성어")))
-        sd, mn, g = _cell(r.get("독음")), _cell(r.get("뜻")), _cell(r.get("분류"))
-        if not (h or sd or mn or g):
-            continue
-        why = idiom_problem(h, sd, mn)
-        if why:
-            errors.append(f"{i}번째 줄 ({h or '한자 없음'}): {why}")
-            continue
-        if h in seen:
-            errors.append(f"{i}번째 줄 ({h}): {seen[h]}번째 줄과 같은 사자성어예요")
-            continue
-        seen[h] = i
-        out.append({"hanja": h, "sound": sd, "meaning": mn, "group": g[:30]})
-    if len(out) > MAX_IDIOMS:
-        errors.append(f"사자성어는 최대 {MAX_IDIOMS}개까지만 저장해요 (지금 {len(out)}개)")
-    return out, errors
-
-
-def add_idioms(items):
-    """새 사자성어 합치기 (이미 있는 것은 먼저 있던 걸 유지). 반환: (새로 담은 수, 겹친 수, 뜻·음이 달라 유지한 것들)"""
+def render_idiom_list():
     s = st.session_state
-    merged, added, dup, conf = merge_items(s.idioms, items, ("meaning", "sound"))
-    if len(merged) > MAX_IDIOMS:
-        merged = merged[:MAX_IDIOMS]
-    s.idioms = merged
-    reset_idiom_quiz()
-    s.ied_ver += 1
-    return added, dup, conf
-
-
-def _report_add(items, probs, dup_in):
-    """붙여넣기·파일로 가져온 결과를 합치고 안내 문구를 만들어요 (콜백/버튼 공용)"""
-    s = st.session_state
-    notes = []
-    if items:
-        added, dup, conf = add_idioms(items)
-        msg = f"사자성어 {added}개를 담았어요."
-        if dup + dup_in:
-            msg += f" (겹쳐서 건너뜀 {dup + dup_in}개)"
-        if conf:
-            notes.append(f"같은 사자성어인데 독음·뜻이 달라서 먼저 있던 것을 유지한 항목 {len(conf)}개: " + ", ".join(conf[:10]))
-        s.flash = msg
+    chars = word_chars()
+    n = len(s.idioms)
+    html(f"<div class='chips'><span class='chip good'>📜 내 한자로 만든 사자성어 {n}개</span>"
+         f"<span class='chip'>🔤 내 한자 {len(chars)}개</span>"
+         f"<span class='chip'>사전 {len(idiom_db())}개 중</span></div>")
+    if not n:
+        st.info("지금 단어장의 한자만으로 만들 수 있는 사자성어가 아직 없어요. 한자를 더 불러오면 자동으로 늘어나요.")
     else:
-        s.flash = "담을 수 있는 사자성어가 없었어요."
-    if probs:
-        notes.append(f"제외한 줄 {len(probs)}개:\n" + "\n".join(f"- {p}" for p in probs[:8])
-                     + (f"\n- … 외 {len(probs) - 8}건" if len(probs) > 8 else ""))
-    s.notice = {"kind": "idiom", "msgs": notes} if notes else None
-
-
-def import_idiom_paste():
-    s = st.session_state
-    ver = s.ied_ver
-    text, grp = s.get(f"idp_t_{ver}", ""), s.get(f"idp_g_{ver}", "")
-    items, probs, dup = build_idioms(parse_idiom_text(text or "", (grp or "").strip()[:30]))
-    _report_add(items, probs, dup)
-
-
-def import_idiom_file():
-    s = st.session_state
-    f = s.get(f"idiom_file_{s.ied_ver}")
-    if f is None:
-        s.flash = "먼저 파일을 골라 주세요."
-        return
-    if f.size > MAX_SET_BYTES * 5:
-        s.flash = "파일이 너무 커요 (10MB 이하)."
-        return
-    try:
-        rows = parse_idiom_file(f)
-    except Exception as e:
-        s.flash = f"파일을 읽지 못했어요: {e}"
-        return
-    items, probs, dup = build_idioms(rows)
-    _report_add(items, probs, dup)
-
-
-def commit_idioms(new):
-    """표 편집 결과 저장. 독음·뜻을 고치면 오답 노트·통계의 복사본도 같이 바꿔요 (한자를 바꾸면 삭제 + 새 항목)"""
-    s = st.session_state
-    old = {x["hanja"]: x for x in s.idioms}
-    keys = {x["hanja"] for x in new}
-    changed = 0
-    for x in new:
-        o = old.get(x["hanja"])
-        if o and (o["sound"] != x["sound"] or o["meaning"] != x["meaning"]):
-            changed += 1
-            for book in (s.idiom_wrong, s.idiom_stats):
-                e = book.get(x["hanja"])
-                if e:
-                    e["sound"], e["meaning"] = x["sound"], x["meaning"]
-    added = sum(1 for x in new if x["hanja"] not in old)
-    removed = sum(1 for h in old if h not in keys)
-    s.idioms = new
-    reset_idiom_quiz()
-    s.ied_ver += 1
-    s.flash = f"사자성어를 저장했어요. (추가 {added} · 수정 {changed} · 삭제 {removed})"
-
-
-def idiom_confirm(kind):
-    st.session_state.idm_confirm = kind
-
-
-def idiom_delete_do():
-    s = st.session_state
-    if s.get("idm_confirm") == "all":
-        n = len(s.idioms)
-        s.idioms = []
-    else:
-        sel = set(s.get("idm_del", []))
-        n = len(sel)
-        s.idioms = [x for x in s.idioms if x["hanja"] not in sel]
-    s.idm_del, s.idm_confirm = [], ""
-    reset_idiom_quiz()
-    s.ied_ver += 1
-    s.flash = f"사자성어 {n}개를 지웠어요. (풀이 기록은 남겨 뒀어요)"
-
-
-def render_idiom_manage():
-    s = st.session_state
-    ver = s.ied_ver
-    show_notice("idiom", "idm_top")
-    st.caption(f"사자성어 {len(s.idioms)}개 (최대 {MAX_IDIOMS}개) · 한 사자성어는 한자 {IDIOM_MIN}~{IDIOM_MAX}자, 독음·뜻은 꼭 있어야 해요.")
-    with st.expander("📂 내장 사자성어 불러오기"):
-        set_picker("idiom", "idiom", show=False)
-    with st.expander("➕ 한 개 추가"):
-        with st.form("idm_add_form", border=False):
-            c1, c2 = st.columns(2)
-            h = c1.text_input("사자성어 (한자)", key=f"ida_h_{ver}")
-            sd = c2.text_input("독음", key=f"ida_s_{ver}")
-            m = st.text_input("뜻", key=f"ida_m_{ver}")
-            g = st.text_input("분류 (선택)", key=f"ida_g_{ver}")
-            add = st.form_submit_button("➕ 사자성어 추가", type="primary", width="stretch")
-        if add:
-            h, sd, m, g = re.sub(r"\s+", "", h or ""), (sd or "").strip(), (m or "").strip(), (g or "").strip()[:30]
-            why = idiom_problem(h, sd, m)
-            if not why and any(x["hanja"] == h for x in s.idioms):
-                why = "이미 있는 사자성어예요. '표로 고치기'에서 수정해 주세요."
-            if not why and len(s.idioms) >= MAX_IDIOMS:
-                why = f"사자성어는 최대 {MAX_IDIOMS}개까지만 담아요."
-            if why:
-                st.warning(why)
+        c1, c2 = st.columns([3, 2])
+        q = c1.text_input("찾기", key="idm_find", placeholder="사자성어·독음·뜻 검색", label_visibility="collapsed")
+        hide = c2.toggle("독음·뜻 가리기", key="idm_hide", help="사자성어만 보이고, 눌러서 독음과 뜻을 확인해요 (암기용)")
+        terms = [t for t in re.split(r"\s+", (q or "").strip()) if t]
+        shown = [x for x in s.idioms
+                 if all(t in x["hanja"] or t in x["sound"] or t in x["meaning"] for t in terms)]
+        st.caption(f"{len(shown)}개 표시 중 · 이 목록의 사자성어가 '시험'에 나와요.")
+        rows = []
+        for x in shown:
+            if hide:
+                rows.append(f"<details class='idm'><summary><span class='idm-h'>{esc(x['hanja'])}</span></summary>"
+                            f"<div class='idm-s'>{esc(x['sound'])}</div><div class='idm-m'>{esc(x['meaning'])}</div></details>")
             else:
-                add_idioms([{"hanja": h, "sound": sd, "meaning": m, "group": g}])
-                s.flash = f"'{h}'을(를) 추가했어요."
-                st.rerun()
-    with st.expander("📋 여러 줄 붙여넣기"):
-        with st.form("idm_paste_form", border=False):
-            st.text_area("한 줄에 하나씩 (한자 독음 뜻)", height=150, key=f"idp_t_{ver}",
-                         placeholder="一石二鳥 일석이조 한 가지 일로 두 가지 이익을 얻음")
-            st.text_input("분류 (선택, 붙여넣은 줄 전부에 같이 적어요)", key=f"idp_g_{ver}")
-            st.form_submit_button("📋 붙여넣은 줄 추가", type="primary", on_click=import_idiom_paste, width="stretch")
-        st.caption("공백으로 나눠도 되고, 탭·'|'·';'·쉼표(한자,독음,뜻)로 나눠도 돼요. '#'으로 시작하는 줄은 무시해요.")
-    with st.expander("📤 CSV 올리기 · 받기"):
-        st.file_uploader("사자성어 파일 (csv / xlsx / txt)", key=f"idiom_file_{ver}")  # 형식 제한 없음: 태블릿 호환
-        st.button("📤 올린 파일 불러오기 (지금 목록에 합치기)", on_click=import_idiom_file, width="stretch", key="idm_import")
-        st.caption("열: 사자성어, 독음, 뜻, 분류(선택). 첫 줄은 제목 줄이어도 돼요.")
-        st.download_button("📥 현재 사자성어 CSV 받기", idioms_csv(s.idioms), "내_사자성어.csv", "text/csv",
-                           width="stretch", key="idm_csv_dl")
-        st.caption("받은 파일을 GitHub 저장소의 idioms/ 폴더에 올리면 '내장 사자성어'가 돼요. 파일 이름이 세트 이름이에요.")
-    with st.expander("✏️ 표로 고치기 · 삭제"):
-        if s.idioms:
-            with st.form("idm_edit_form", border=False):
-                edited = st.data_editor(
-                    idioms_df(s.idioms), num_rows="dynamic", hide_index=True, key=f"idm_editor_{ver}",
-                    column_config={
-                        "사자성어": st.column_config.TextColumn("사자성어", max_chars=IDIOM_MAX),
-                        "독음": st.column_config.TextColumn("독음", max_chars=60),
-                        "뜻": st.column_config.TextColumn("뜻", max_chars=300),
-                        "분류": st.column_config.TextColumn("분류", max_chars=30),
-                    })
-                saved = st.form_submit_button("💾 사자성어 저장", type="primary", width="stretch")
-            if saved:
-                new, errs = idioms_from_df(edited)
-                if errs:
-                    st.error("저장하지 못했어요. 아래를 고친 뒤 다시 눌러 주세요.\n\n"
-                             + "\n".join(f"- {e}" for e in errs[:8])
-                             + (f"\n- … 외 {len(errs) - 8}건" if len(errs) > 8 else ""))
-                elif new == s.idioms:
-                    st.info("바뀐 내용이 없어요.")
-                else:
-                    commit_idioms(new)
-                    st.rerun()
-            st.markdown("**골라서 삭제**")
-            keys = [x["hanja"] for x in s.idioms]
-            snd = {x["hanja"]: x["sound"] for x in s.idioms}
-            s.idm_del = [x for x in s.get("idm_del", []) if x in snd]
-            st.multiselect("지울 사자성어", keys, key="idm_del", format_func=lambda k: f"{k} {snd.get(k, '')}",
-                           placeholder="여러 개 고르기")
-            if s.get("idm_confirm"):
-                n = len(s.idioms) if s.idm_confirm == "all" else len(s.idm_del)
-                st.warning(f"정말 {n}개를 지울까요? 되돌릴 수 없어요.")
-                y, no = st.columns(2)
-                y.button("네, 지울게요", on_click=idiom_delete_do, width="stretch", key="idm_del_yes")
-                no.button("아니요", on_click=idiom_confirm, args=("",), width="stretch", key="idm_del_no")
-            else:
-                d1, d2 = st.columns(2)
-                d1.button("선택 삭제", on_click=idiom_confirm, args=("del",), disabled=not s.idm_del,
-                          width="stretch", key="idm_del_ask")
-                d2.button("전체 비우기", on_click=idiom_confirm, args=("all",), width="stretch", key="idm_all_ask")
-        else:
-            st.caption("아직 사자성어가 없어요. 위에서 추가하거나 불러와 주세요.")
+                rows.append(_idiom_row(x))
+        html("".join(rows))
+    near = near_idioms(chars)
+    if near:
+        near.sort(key=lambda t: t[0]["sound"])
+        with st.expander(f"🔎 한 글자만 더 알면 되는 사자성어 ({len(near)}개)"):
+            st.caption("빨간 한자만 익히면 이 사자성어가 내 목록에 들어와요.")
+            html("".join(_idiom_row(x, m) for x, m in near[:60]))
+            if len(near) > 60:
+                st.caption(f"… 외 {len(near) - 60}개")
 
 
 def render_idioms():
     s = st.session_state
-    views = ["시험", "관리", "오답 노트"]
+    views = ["목록", "시험", "오답 노트"]
     if s.get("idm_view") not in views:
         s.idm_view = views[0]
     st.radio("사자성어 화면", views, key="idm_view", horizontal=True, label_visibility="collapsed")
-    if s.idm_view == "관리":
-        render_idiom_manage()
-    elif s.idm_view == "오답 노트":
+    if s.idm_view == "오답 노트":
         render_idiom_wrong()
-    else:
+    elif s.idm_view == "시험":
         render_idiom_exam()
-
-
-# ----------------------------------------------------------------------
-# 모의고사 (100점 만점) — 정답은 끝난 뒤에 한꺼번에 보여줘요
-# ----------------------------------------------------------------------
-def exam_pool():
-    """모의고사 출제 범위에 해당하는 한자들"""
-    s = st.session_state
-    src = s.get("ex_src", "전체 단어")
-    if src == "오답 노트만":
-        return [{"hanja": v["hanja"], "meaning": v["meaning"], "sound": v["sound"], "group": ""}
-                for v in s.wrong.values() if v.get("sound")]
-    groups = s.get("ex_groups", []) if src == "분류 선택" else []
-    pool = [w for w in s.words if not groups or w.get("group") in groups]
-    if src == "별표 한자만":
-        pool = [w for w in pool if is_star(w["hanja"])]
-    return pool
-
-
-def exam_idiom_pool():
-    s = st.session_state
-    if s.get("ex_src") == "오답 노트만":
-        return idiom_pool_for("오답 노트만", [])
-    return [dict(x) for x in s.idioms]
-
-
-def exam_limits(pool):
-    """유형별로 지금 낼 수 있는 최대 문항 수 (0이면 막힌 유형)"""
-    s = st.session_state
-    font_ok = bool(HAS_CANVAS and find_font())
-    return {
-        "ko": len(pool),
-        "write": sum(1 for w in pool if len(w["hanja"]) == 1) if font_ok else 0,
-        "choice": len(pool) if len(s.words) >= 4 else 0,
-        "idiom": len(exam_idiom_pool()) if len(s.idioms) >= 4 else 0,
-    }
-
-
-def exam_blocked_reasons(lim, pool):
-    s = st.session_state
-    r = {}
-    if not pool:
-        r["ko"] = "고른 범위에 한자가 없어요"
-    if lim["write"] == 0:
-        r["write"] = ("손글씨 기능(캔버스)이나 한자 폰트가 없어요" if not (HAS_CANVAS and find_font())
-                      else "범위 안에 한 글자 한자가 없어요")
-    if lim["choice"] == 0:
-        r["choice"] = "단어장에 한자가 4개 이상 있고 범위 안에 한자가 있어야 해요"
-    if lim["idiom"] == 0:
-        r["idiom"] = (f"사자성어가 4개 이상 있어야 해요 (지금 {len(s.idioms)}개)" if len(s.idioms) < 4
-                      else "범위(오답 노트)에 사자성어가 없어요")
-    return r
-
-
-def exam_total(lim=None):
-    """(총 문항 수, 배점 합계) — 막힌 유형은 0문항으로 쳐요"""
-    s = st.session_state
-    lim = lim if lim is not None else exam_limits(exam_pool())
-    n_all, tot = 0, 0.0
-    for k in EXAM_ORDER:
-        n = 0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)
-        n_all += n
-        tot += n * _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0)
-    return n_all, round(tot, 2)
-
-
-def fit_points():
-    """배점을 비례해서 합계 100점으로 맞춰요 (소수 첫째 자리)"""
-    s = st.session_state
-    lim = exam_limits(exam_pool())
-    n = {k: (0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)) for k in EXAM_ORDER}
-    act = [k for k in EXAM_ORDER if n[k] > 0]
-    if not act:
-        return
-    pt = {k: _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0) for k in EXAM_ORDER}
-    total = sum(n[k] * pt[k] for k in act)
-    if total <= 0:
-        eq = 100.0 / sum(n[k] for k in act)
-        pt.update({k: eq for k in act})
-        total = 100.0
-    f = 100.0 / total
-    for k in act:
-        pt[k] = round(min(100.0, pt[k] * f), 1)
-    resid = round(100.0 - sum(n[k] * pt[k] for k in act), 4)
-    if abs(resid) > 1e-6:  # 반올림으로 생긴 차이를 한 유형에서 딱 맞게 메울 수 있으면 메워요
-        for k in reversed(act):
-            fixed = round(pt[k] + resid / n[k], 1)
-            if 0 <= fixed <= 100 and abs(sum(n[j] * (fixed if j == k else pt[j]) for j in act) - 100.0) < 1e-6:
-                pt[k] = fixed
-                break
-    for k in act:
-        s[f"ex_pt_{k}"] = float(pt[k])
-    s.flash = "배점을 100점에 맞췄어요."
-
-
-def start_exam():
-    s = st.session_state
-    pool = exam_pool()
-    lim = exam_limits(pool)
-    want = {k: (0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100)) for k in EXAM_ORDER}
-    pts = {k: _flt(s.get(f"ex_pt_{k}"), 0.0, 0.0, 100.0) for k in EXAM_ORDER}
-    if sum(want.values()) == 0:
-        s.flash = "문항이 0개예요. 문항 수를 정해 주세요."
-        return
-    random.shuffle(pool)
-    singles = [w for w in pool if len(w["hanja"]) == 1]
-    write_w = singles[: want["write"]]  # 같은 한자가 여러 유형에 겹쳐 나오지 않게 나눠 뽑아요
-    used = {w["hanja"] for w in write_w}
-    rest = [w for w in pool if w["hanja"] not in used]
-    ko_w, rest = rest[: want["ko"]], rest[want["ko"]:]
-    ch_w = rest[: want["choice"]]
-    items = [{"kind": "ko", "pts": pts["ko"], "q": {"w": w, "type": "read"}} for w in ko_w]
-    items += [{"kind": "write", "pts": pts["write"], "q": {"w": w, "type": "write"}} for w in write_w]
-    items += [{"kind": "choice", "pts": pts["choice"],
-               "q": make_item(w, random.choice(["choice_ko", "choice_hj"]))} for w in ch_w]
-    got = {"ko": len(ko_w), "write": len(write_w), "choice": len(ch_w), "idiom": 0}
-    if want["idiom"]:
-        ipool = exam_idiom_pool()
-        random.shuffle(ipool)
-        types = [t for t in idiom_types_for("섞어서") if t != "i_hw"]
-        cpool = idiom_char_pool()
-        picked = ipool[: want["idiom"]]
-        items += [{"kind": "idiom", "pts": pts["idiom"], "q": make_idiom_item(it, random.choice(types), cpool)}
-                  for it in picked]
-        got["idiom"] = len(picked)
-    if not items:
-        s.flash = "문제를 만들 수 없어요. 범위를 확인해 주세요."
-        return
-    short = [f"{EXAM_TYPES[k]} {want[k]}→{got[k]}문항" for k in EXAM_ORDER if want[k] and got[k] < want[k]]
-    s.exam = {"items": items, "pos": 0, "answers": [], "start": now_kst_str(), "t0": time.time(),
-              "apply": s.get("ex_apply", "반영해요") == "반영해요", "src": s.get("ex_src", "전체 단어")}
-    s.exam_result, s.ex_quit = None, False
-    s.ex_nonce += 1
-    s.flash = ("범위 안 한자가 모자라서 문항을 줄였어요: " + ", ".join(short)) if short else ""
-
-
-def exam_wrong_row(n, it, a):
-    k, q = it["kind"], it["q"]
-    if k == "idiom":
-        x = q["it"]
-        return {"번호": n, "유형": f"{EXAM_TYPES[k]} · {IDIOM_LABELS[q['type']]}", "문제": idiom_q_text(q),
-                "내 답": a["answer"], "정답": f"{idiom_a_text(q)}  ({x['hanja']} · {x['meaning']})", "내 메모": ""}
-    w, ty = q["w"], q["type"]
-    if k == "write" or ty == "choice_hj":
-        question, right = _label(w), w["hanja"]
     else:
-        question, right = w["hanja"], _label(w)
-    return {"번호": n, "유형": EXAM_TYPES[k], "문제": question, "내 답": a["answer"], "정답": right,
-            "내 메모": note_of(w["hanja"])}
-
-
-def finish_exam():
-    """채점 결과를 정리해서 기록(s.exams)에 남기고, 옵션에 따라 오답 노트·복습 기록에 반영해요"""
-    s = st.session_state
-    ex = s.exam
-    if not ex:
-        return
-    secs = int(max(0, time.time() - ex["t0"]))
-    types = {k: {"score": 0.0, "max": 0.0, "n": 0, "right": 0} for k in EXAM_ORDER}
-    wrong = []
-    for n, (it, a) in enumerate(zip(ex["items"], ex["answers"]), 1):
-        t = types[it["kind"]]
-        t["max"] += it["pts"]
-        t["n"] += 1
-        if a["ok"]:
-            t["score"] += it["pts"]
-            t["right"] += 1
-        else:
-            wrong.append(exam_wrong_row(n, it, a))
-    types = {k: {"score": round(v["score"], 1), "max": round(v["max"], 1), "n": v["n"], "right": v["right"]}
-             for k, v in types.items() if v["n"]}
-    full = round(sum(v["max"] for v in types.values()), 1)
-    score = round(sum(v["score"] for v in types.values()), 1)
-    entry = {"start": ex["start"], "date": ex["start"][:10], "score": score, "full": full or 100.0,
-             "n": len(ex["items"]), "types": types, "secs": secs}
-    s.exams.append(entry)
-    s.exams = s.exams[-MAX_EXAMS:]
-    if ex["apply"]:
-        retry = ex.get("src") == "오답 노트만"
-        for it, a in zip(ex["items"], ex["answers"]):
-            q = it["q"]
-            if it["kind"] == "idiom":
-                record_idiom(q, a["ok"], a["answer"], retry=retry)
-            else:
-                record_external(q["w"], q["type"], a["ok"], a["answer"], retry=retry)
-    s.exam_result = {"entry": entry, "wrong": wrong, "applied": bool(ex["apply"]),
-                     "end": now_kst_str()}
-    s.exam, s.ex_quit = None, False
-
-
-def exam_answer(ok, shown):
-    s = st.session_state
-    ex = s.exam
-    if not ex or ex["pos"] >= len(ex["items"]):
-        return
-    ex["answers"].append({"ok": bool(ok), "answer": str(shown)})
-    ex["pos"] += 1
-    s.ex_nonce += 1
-    if ex["pos"] >= len(ex["items"]):
-        finish_exam()
-
-
-def exam_idiom_answer(ok, shown):
-    exam_answer(ok, shown)
-
-
-def exam_pick_choice(q, o):
-    w, ty = q["w"], q["type"]
-    if o is None:
-        exam_answer(False, "(모르겠어요)")
-        return
-    shown = o["hanja"] if ty == "choice_hj" else o["label"]
-    exam_answer(o["hanja"] == w["hanja"], shown)
-
-
-def exam_quit_ask():
-    st.session_state.ex_quit = True
-
-
-def exam_quit_cancel():
-    st.session_state.ex_quit = False
-
-
-def exam_quit():
-    s = st.session_state
-    s.exam, s.ex_quit = None, False
-    s.ex_nonce += 1
-    s.flash = "시험을 그만뒀어요. 기록에는 남기지 않았어요."
-
-
-def close_exam_result():
-    st.session_state.exam_result = None
-
-
-# --- 화면: 시험 보는 중 ---------------------------------------------------------------
-def render_exam_ko(q):
-    s = st.session_state
-    w = q["w"]
-    hanja_card(w["hanja"])
-    html("<div class='ask'>이 한자의 <b>뜻과 음</b>을 입력하세요. 예) 하늘 천</div>")
-    base = f"{s.exam['pos']}_{s.ex_nonce}"
-    with st.form(f"exf_{base}", border=False):
-        ans = st.text_input("답", key=f"exa_{base}", label_visibility="collapsed", placeholder="뜻과 음 (예: 하늘 천)")
-        c1, c2 = st.columns(2)
-        go = c1.form_submit_button("다음 문제 ➡️", type="primary", width="stretch")
-        skip = c2.form_submit_button("모르겠어요", width="stretch")
-    if go or skip:
-        a = (ans or "").strip() if go else ""
-        ok = check_reading(a, w)[0] if a else False
-        exam_answer(ok, a or ("(빈칸)" if go else "(모르겠어요)"))
-        st.rerun()
-
-
-def render_exam_write(q):
-    s = st.session_state
-    w = q["w"]
-    font, px = find_font(), canvas_px()
-    base = f"{s.exam['pos']}_{s.ex_nonce}"
-    left, right = st.columns(2)
-    with left:
-        meaning_card(w)
-        html("<div class='ask'>에 해당하는 한자를 오른쪽 칸에 쓰세요</div>")
-    canvas_backdrop_for("canvas_box_exam", grid_image(px), px)
-    with right:
-        with st.container(key="canvas_box_exam"):
-            res = draw_canvas(f"xcv_{base}_{s.hw_clear}_{px}", px)
-    b1, b2, b3 = st.columns(3)
-    if b1.button("다음 문제 ➡️", key=f"xw_go_{base}", type="primary", width="stretch"):
-        cands = [x["hanja"] for x in s.words if len(x["hanja"]) == 1]
-        ok, shown = hw_grade(res, w["hanja"], font, cands)
-        exam_answer(ok, shown)
-        st.rerun()
-    b2.button("지우기", key=f"xw_clr_{base}", on_click=hw_clear, width="stretch")
-    if b3.button("모르겠어요", key=f"xw_skip_{base}", width="stretch"):
-        exam_answer(False, "(모르겠어요)")
-        st.rerun()
-
-
-def render_exam_choice(q):
-    s = st.session_state
-    w, ty = q["w"], q["type"]
-    if ty == "choice_ko":
-        hanja_card(w["hanja"])
-        html("<div class='ask'>이 한자의 <b>뜻과 음</b>은?</div>")
-    else:
-        meaning_card(w)
-        html("<div class='ask'>이 뜻·음에 해당하는 <b>한자</b>는?</div>")
-    base = f"{s.exam['pos']}_{s.ex_nonce}"
-    with st.container(key="xc_text_exam" if ty == "choice_ko" else "xc_hj_exam"):
-        cols = st.columns(2)
-        for i, o in enumerate(q["opts"]):
-            text = o["label"] if ty == "choice_ko" else o["hanja"]
-            cols[i % 2].button(text, key=f"xo_{base}_{i}", on_click=exam_pick_choice, args=(q, o), width="stretch")
-    st.button("모르겠어요", key=f"xo_skip_{base}", on_click=exam_pick_choice, args=(q, None))
-
-
-def render_exam_run():
-    s = st.session_state
-    ex = s.exam
-    items, pos = ex["items"], ex["pos"]
-    it = items[pos]
-    st.progress(pos / len(items), text=f"{pos + 1} / {len(items)}  ·  {EXAM_TYPES[it['kind']]}  ·  {fmt_pts(it['pts'])}점")
-    if s.ex_quit:
-        st.warning("정말 그만둘까요? 지금까지 푼 답은 기록에 남지 않아요.")
-        c1, c2 = st.columns(2)
-        c1.button("네, 그만둘래요", key="ex_quit_yes", on_click=exam_quit, width="stretch")
-        c2.button("계속 풀게요", key="ex_quit_no", on_click=exam_quit_cancel, width="stretch", type="primary")
-        return
-    kind = it["kind"]
-    if kind == "ko":
-        render_exam_ko(it["q"])
-    elif kind == "write":
-        render_exam_write(it["q"])
-    elif kind == "choice":
-        render_exam_choice(it["q"])
-    else:
-        render_idiom_q(it["q"], "exm", exam_idiom_answer, pos, s.ex_nonce)
-    st.button("그만두기", key="ex_quit_btn", on_click=exam_quit_ask)
-
-
-# --- 화면: 기록 그래프 / 결과 -----------------------------------------------------------
-def exam_pct(e):
-    return round(e["score"] / e["full"] * 100, 1) if e.get("full") else 0.0
-
-
-def render_exam_history(limit=20):
-    s = st.session_state
-    if not s.exams:
-        st.caption("아직 본 모의고사가 없어요.")
-        return
-    last = s.exams[-limit:]
-    target = _int(s.get("set_target"), 90, 0, 100)
-    first = len(s.exams) - len(last) + 1
-    df = pd.DataFrame({"회차": list(range(first, first + len(last))),
-                       "내 점수": [exam_pct(e) for e in last], "목표 점수": [target] * len(last)})
-    st.line_chart(df, x="회차", y=["내 점수", "목표 점수"], color=["#2B3A67", "#B8372C"])
-    st.caption("점수는 100점 만점으로 환산한 값이에요. 빨간 선이 목표 점수예요.")
-    st.dataframe(pd.DataFrame([{"회차": first + i, "날짜": e["date"], "점수": f"{fmt_pts(e['score'])} / {fmt_pts(e['full'])}",
-                                "문항": e["n"], "걸린 시간": fmt_secs(e["secs"])} for i, e in enumerate(last)][::-1]),
-                 width="stretch", hide_index=True)
-
-
-def render_exam_result():
-    s = st.session_state
-    r = s.exam_result
-    e = r["entry"]
-    st.subheader("모의고사 결과예요")
-    html(f"<div class='score-box'><div class='big'>{fmt_pts(e['score'])} / {fmt_pts(e['full'])}점</div>"
-         f"<div class='lbl'>{e['n']}문항 · 걸린 시간 {fmt_secs(e['secs'])}</div></div>")
-    chips = []
-    if len(s.exams) >= 2:
-        diff = round(exam_pct(e) - exam_pct(s.exams[-2]), 1)
-        chips.append(f"<span class='chip {'good' if diff >= 0 else 'hot'}'>지난 시험보다 {diff:+g}점</span>")
-    target = _int(s.get("set_target"), 90, 0, 100)
-    chips.append(f"<span class='chip {'good' if exam_pct(e) >= target else ''}'>목표 {target}점</span>")
-    chips.append("<span class='chip'>" + ("오답 노트·복습 기록에 반영했어요" if r["applied"]
-                                       else "오답 노트·복습 기록에는 반영하지 않았어요") + "</span>")
-    html("<div class='chips'>" + "".join(chips) + "</div>")
-    st.markdown("##### 유형별 점수")
-    st.dataframe(pd.DataFrame([{"유형": EXAM_TYPES[k], "맞힌 문항": f"{v['right']} / {v['n']}",
-                                "점수": f"{fmt_pts(v['score'])} / {fmt_pts(v['max'])}"}
-                               for k, v in e["types"].items()]), width="stretch", hide_index=True)
-    if r["wrong"]:
-        st.markdown("##### 틀린 문제")
-        st.dataframe(pd.DataFrame(r["wrong"]), width="stretch", hide_index=True)
-    else:
-        st.success("전부 맞혔어요! 🎉")
-    st.markdown("##### 점수 추이")
-    render_exam_history()
-    st.button("🔁 새 모의고사 보기", type="primary", on_click=close_exam_result, width="stretch", key="ex_new")
-
-
-# --- 화면: 시작 설정 ------------------------------------------------------------------
-def render_exam_setup():
-    s = st.session_state
-    st.subheader("모의고사 (100점 만점)")
-    st.caption("정답은 끝난 뒤에 한꺼번에 보여줘요. 힌트는 없고, 시간 제한도 없어요. 걸린 시간만 기록해요. "
-               "(모르겠어요는 오답, 빈칸도 괜찮아요)")
-    if s.get("ex_src") not in EXAM_SRC:
-        s.ex_src = EXAM_SRC[0]
-    st.radio("출제 범위", EXAM_SRC, key="ex_src", horizontal=True)
-    if s.ex_src == "분류 선택":
-        groups = sorted({w["group"] for w in s.words if w.get("group")},
-                        key=lambda g: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", g)])
-        if groups:
-            s.ex_groups = [g for g in s.get("ex_groups", []) if g in groups]
-            st.multiselect("분류 (비워 두면 전체)", groups, key="ex_groups", placeholder="전체 (눌러서 고르기)")
-        else:
-            st.caption("분류가 적힌 한자가 없어서 전체에서 나와요.")
-    pool = exam_pool()
-    lim = exam_limits(pool)
-    why = exam_blocked_reasons(lim, pool)
-    st.markdown("**유형별 문항 수와 배점**")
-    h = st.columns([5, 3, 3])
-    h[0].caption("유형")
-    h[1].caption("문항 수")
-    h[2].caption("문항당 배점")
-    for k in EXAM_ORDER:
-        off = lim[k] == 0
-        r = st.columns([5, 3, 3], vertical_alignment="center")
-        r[0].write(EXAM_TYPES[k] + (" 🔒" if off else ""))
-        r[1].number_input("문항 수", 0, 100, step=1, key=f"ex_n_{k}", label_visibility="collapsed", disabled=off)
-        r[2].number_input("배점", 0.0, 100.0, step=0.5, format="%.1f", key=f"ex_pt_{k}",
-                          label_visibility="collapsed", disabled=off)
-        if off and k in why:
-            st.caption(f"🔒 {EXAM_TYPES[k]}: {why[k]}")
-    n_all, tot = exam_total(lim)
-    need = sum(0 if lim[k] == 0 else _int(s.get(f"ex_n_{k}"), 0, 0, 100) for k in ("ko", "write", "choice"))
-    if need > len(pool):
-        st.warning(f"범위 안 한자가 {len(pool)}개라서 한자 문항 {need}개를 다 채울 수 없어요. 모자란 만큼 줄어들어요.")
-    m1, m2 = st.columns(2)
-    m1.metric("총 문항", f"{n_all}개")
-    m2.metric("배점 합계", f"{fmt_pts(tot)}점")
-    if n_all and abs(tot - 100.0) > 0.05:
-        st.warning(f"배점 합계가 {fmt_pts(tot)}점이에요. 100점 만점이 아니에요.")
-        st.button("⚖️ 100점으로 맞추기", on_click=fit_points, width="stretch", key="ex_fit",
-                  help="지금 배점의 비율은 그대로 두고 합계만 100점이 되게 조정해요. (소수 첫째 자리)")
-        st.caption("소수 첫째 자리로 반올림하기 때문에 정확히 100점이 안 될 수도 있어요. 그땐 배점을 직접 조정해 주세요.")
-    if s.get("ex_apply") not in ["반영해요", "반영 안 해요"]:
-        s.ex_apply = "반영해요"
-    st.radio("시험이 끝나면 결과를 오답 노트·복습 기록에 …", ["반영해요", "반영 안 해요"], key="ex_apply", horizontal=True,
-             help="'반영해요'를 고르면 틀린 문제는 오답 노트에 담기고, 맞고 틀림이 복습 주기와 통계에도 들어가요.")
-    st.caption("사자성어 문항은 범위와 상관없이 전체 사자성어에서 나와요. (범위가 '오답 노트만'이면 사자성어 오답에서 나와요)")
-    st.button("▶️ 시험 시작", type="primary", on_click=start_exam, disabled=(n_all == 0), width="stretch", key="ex_start")
-    if s.exams:
-        with st.expander("📈 지난 모의고사 기록"):
-            st.caption(f"지금까지 {len(s.exams)}회")
-            render_exam_history()
-
-
-def render_exam():
-    s = st.session_state
-    if s.exam:
-        render_exam_run()
-    elif s.exam_result:
-        render_exam_result()
-    else:
-        render_exam_setup()
+        render_idiom_list()
 
 
 # ----------------------------------------------------------------------
@@ -4201,16 +4135,13 @@ def render_plan_card():
             html("<div class='chips'>" + "".join(chips) + "</div>")
             html(f"<div class='score-box'><div class='big'>예상 {p['expected']}점 / 목표 {target}점</div>"
                  f"<div class='lbl'>참고용 · 본 한자 {p['seen_ratio']:.0%} × 최근 정답률 {p['acc']:.0%}</div></div>")
-            if s.exams:
-                last = s.exams[-1]
-                st.caption(f"최근 모의고사 {fmt_pts(exam_pct(last))}점 ({last['date']})")
             if p["D"] <= 2:
                 st.caption("시험 직전 이틀은 새 한자 없이 복습만 해요.")
             n_today = p["review"] + p["new_today"]
             st.button(f"▶️ 오늘 플랜 시작 (복습 {p['review']} + 새 한자 {p['new_today']})", type="primary",
                       on_click=start_plan, disabled=(n_today == 0), width="stretch", key="plan_start")
             if n_today == 0:
-                st.caption("오늘 할 몫을 다 했어요. 🎉 '시험' 탭에서 모의고사로 실력을 확인해 보세요.")
+                st.caption("오늘 할 몫을 다 했어요. 🎉")
             st.caption("계산 방법(참고용): 오늘 새 한자 = 안 본 한자 ÷ (남은 날 − 2)를 올림 (마지막 이틀은 복습 기간) · "
                        "예상 점수 = 100 × 본 한자 비율 × 최근 정답률 · 오늘 복습 = 복습 날짜가 된 한자")
         with st.expander("⚙️ 플랜 설정", expanded=(D is None)):
@@ -4271,7 +4202,7 @@ def render_note_tools(words):
             b1, b2 = st.columns(2)
             b1.form_submit_button("★ 별표 주기", on_click=bulk_star, args=(True,), width="stretch")
             b2.form_submit_button("☆ 별표 빼기", on_click=bulk_star, args=(False,), width="stretch")
-        st.caption("별표를 준 한자는 연습·카드의 '별표 한자만' 범위로 풀 수 있고, 모의고사 범위로도 골라요.")
+        st.caption("별표를 준 한자는 연습·카드의 '별표 한자만' 범위로 풀 수 있어요.")
 
 
 def render_word_edit():
