@@ -2095,6 +2095,28 @@ details.idm[open] summary{margin-bottom:.3rem;}
   background:#fff; border:1px solid var(--line); border-radius:10px; color:var(--ink); font-size:.92rem; line-height:1.35;}
 .step b{display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:var(--indigo);
   color:#fff; font:700 1rem/1 var(--serif);}
+
+/* 한자 분해(구성 글자) */
+.wcard details.bu summary{cursor:pointer; list-style:none; padding:0; font:500 2.6rem/1.1 var(--serif); color:var(--ink);}
+.wcard details.bu summary::-webkit-details-marker{display:none;}
+.wcard details.bu summary::after{content:"🧩"; font-size:.65rem; margin-left:.1rem; opacity:.55; vertical-align:super;}
+.wcard:has(details.bu[open]){grid-column:1/-1;}
+.bu-body{display:none; margin-top:.6rem; padding:.6rem .75rem; background:#F6F8FC; border:1px solid var(--line);
+  border-radius:8px; text-align:left; color:var(--ink); font-size:.95rem;}
+.wcard details.bu[open] ~ .bu-body, .bu-body.open{display:block;}
+.bu-char{padding:.45rem 0; border-top:1px dashed var(--line);}
+.bu-char:first-child{border-top:0;}
+.bu-eq{display:flex; flex-wrap:wrap; align-items:center; gap:.35rem .5rem;}
+.bu-big{font:700 2.2rem/1 var(--serif); color:var(--seal);}
+.bu-op{color:var(--soft); font-weight:700;}
+.bu-part{display:inline-flex; flex-direction:column; align-items:center; min-width:3.4rem; padding:.25rem .5rem;
+  background:#fff; border:1px solid var(--line); border-radius:8px; line-height:1.2;}
+.bu-part b{font:500 1.7rem/1.1 var(--serif);}
+.bu-part i{font-style:normal; font-size:.78rem; color:var(--soft);}
+.bu-part em{font-style:normal; font-size:.72rem; color:var(--seal); font-weight:700;}
+.bu-part.rad{border-color:var(--jade); background:#EEF7F4;}
+.bu-note{color:var(--soft); font-size:.82rem; margin-top:.2rem;}
+.bu-sub{margin:.4rem 0 0 .3rem; padding-left:.7rem; border-left:3px solid var(--line);}
 </style>
 """
 
@@ -2663,6 +2685,113 @@ def render_wrong():
     st.caption("오답 노트 모드에서 맞히면 노트에서 자동으로 빠져요. 풀이는 '연습' 탭에서 진행돼요.")
 
 
+# ----------------------------------------------------------------------
+# 학습 잔디 (깃허브 스타일 히트맵) — 최근 1년, 하루에 푼 문제가 많을수록 진해져요
+# ----------------------------------------------------------------------
+HM_COLORS = ["#E7EBF2", "#BFE0D6", "#86C5B4", "#4FA08D", "#2F7D6D"]
+HM_WEEKS = 53
+
+
+def _hm_day_totals(history):
+    """{날짜: (맞음, 틀림)} — 날짜가 이상한 기록은 건너뛰어요"""
+    out = {}
+    for k, v in (history or {}).items():
+        try:
+            d = date.fromisoformat(str(k))
+            r, w = int(v.get("right", 0)), int(v.get("wrong", 0))
+        except Exception:
+            continue
+        if r + w > 0:
+            out[d] = (r, w)
+    return out
+
+
+def study_streaks(history, today):
+    """(지금 연속일, 최장 연속일, 최근 1년 학습한 날 수). 오늘 아직 안 풀었어도 어제까지 이어졌으면 연속이 유지돼요"""
+    days = _hm_day_totals(history)
+    if not days:
+        return 0, 0, 0
+    cur, d = 0, today if today in days else today - timedelta(days=1)
+    while d in days:
+        cur += 1
+        d -= timedelta(days=1)
+    best = run = 0
+    prev = None
+    for d in sorted(days):
+        run = run + 1 if prev is not None and (d - prev).days == 1 else 1
+        best = max(best, run)
+        prev = d
+    year_ago = today - timedelta(days=364)
+    return cur, best, sum(1 for d in days if year_ago <= d <= today)
+
+
+def heatmap_levels(totals):
+    """하루 학습량 → 0~4단계. 가장 많이 푼 날 하나에 쏠리지 않게 사분위수로 나눠요"""
+    vals = sorted(t for t in totals if t > 0)
+    if not vals:
+        return lambda t: 0
+    q1, q2, q3 = vals[(len(vals) - 1) // 4], vals[(len(vals) - 1) // 2], vals[(3 * (len(vals) - 1)) // 4]
+    return lambda t: 0 if t <= 0 else 1 + (t > q1) + (t > q2) + (t > q3)
+
+
+def heatmap_html(history, today):
+    """iframe 안에 넣을 완성된 HTML (오른쪽 끝 = 이번 주로 자동 스크롤)"""
+    days = _hm_day_totals(history)
+    start = today - timedelta(days=(today.weekday() + 1) % 7) - timedelta(weeks=HM_WEEKS - 1)  # 일요일 시작
+    span = [start + timedelta(days=i) for i in range(HM_WEEKS * 7)]
+    level = heatmap_levels([sum(days.get(d, (0, 0))) for d in span if d <= today])
+    cells = []
+    for w in range(HM_WEEKS):
+        week = span[w * 7:(w + 1) * 7]
+        first = next((d for d in week if d.day == 1 and d <= today), None)
+        cells.append(f"<div class='mo'>{first.month}월</div>" if first else "<div class='mo'></div>")
+        for d in week:
+            if d > today:
+                cells.append("<div class='c x'></div>")
+                continue
+            r, wr = days.get(d, (0, 0))
+            tip = f"{d.year}.{d.month}.{d.day} · " + (f"맞음 {r} · 틀림 {wr}" if r + wr else "푼 문제 없음")
+            cls = f"c l{level(r + wr)}" + (" t" if d == today else "")
+            cells.append(f"<div class='{cls}' title='{esc(tip)}' data-tip='{esc(tip)}'></div>")
+    daylab = "".join(f"<div>{x}</div>" for x in ["", "", "월", "", "수", "", "금", ""])
+    colors = "".join(f".l{i}{{background:{c}}}" for i, c in enumerate(HM_COLORS))
+    legend = "".join(f"<span class='c l{i}'></span>" for i in range(5))
+    return f"""<!doctype html><html><head><meta charset='utf-8'><style>
+body{{margin:0; font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif; color:#1E2438;}}
+#w{{overflow-x:auto; padding:2px 2px 6px;}}
+.in{{display:flex; width:max-content;}}
+.dl{{display:grid; grid-template-rows:repeat(8,12px); gap:3px; font-size:10px; color:#5B6479; margin-right:6px; line-height:12px; position:sticky; left:0; background:#fff; z-index:1; padding-right:2px;}}
+.g{{display:grid; grid-template-rows:repeat(8,12px); grid-auto-flow:column; grid-auto-columns:12px; gap:3px;}}
+.mo{{font-size:10px; color:#5B6479; line-height:12px; white-space:nowrap; overflow:visible;}}
+.c{{width:12px; height:12px; border-radius:3px; box-sizing:border-box;}}
+.c.x{{background:transparent;}}
+.c.t{{outline:2px solid #B8372C; outline-offset:-1px;}}
+{colors}
+#i{{font-size:12px; color:#5B6479; margin-top:4px; min-height:16px;}}
+.lg{{display:flex; align-items:center; gap:3px; font-size:11px; color:#5B6479; justify-content:flex-end; margin-top:4px;}}
+</style></head><body>
+<div id='w'><div class='in'><div class='dl'>{daylab}</div><div class='g'>{''.join(cells)}</div></div></div>
+<div class='lg'>적음 {legend} 많음</div>
+<div id='i'>칸을 누르면 그날 기록이 나와요.</div>
+<script>
+var w=document.getElementById('w'); w.scrollLeft=w.scrollWidth;
+document.querySelectorAll('.c[data-tip]').forEach(function(e){{e.addEventListener('click',function(){{document.getElementById('i').textContent=e.getAttribute('data-tip');}});}});
+</script></body></html>"""
+
+
+def render_heatmap():
+    s = st.session_state
+    today = today_date()
+    cur, best, n_year = study_streaks(s.history, today)
+    st.markdown("##### 🌱 학습 잔디 (최근 1년)")
+    a, b, c = st.columns(3)
+    a.metric("🔥 지금 연속", f"{cur}일")
+    b.metric("🏆 최장 연속", f"{best}일")
+    c.metric("📅 1년간 공부한 날", f"{n_year}일")
+    components.html(heatmap_html(s.history, today), height=170)
+    st.caption("하루에 푼 문제가 많을수록 진한 초록이에요. 빨간 테두리가 오늘이에요. 오늘 아직 안 풀었어도 어제까지 이어졌다면 연속 기록은 유지돼요.")
+
+
 def render_stats():
     s = st.session_state
     if not s.stats:
@@ -2683,14 +2812,15 @@ def render_stats():
     c.metric("약한 한자 (정답률 50% 미만)", int((df["정답률(%)"] < 50).sum()))
 
     if s.history:
-        st.markdown("##### 최근 14일")
-        days = [(today_date() - timedelta(days=d)).isoformat() for d in range(13, -1, -1)]
-        hd = pd.DataFrame(
-            {"맞음": [s.history.get(d, {}).get("right", 0) for d in days],
-             "틀림": [s.history.get(d, {}).get("wrong", 0) for d in days]},
-            index=[d[5:] for d in days],
-        )
-        st.bar_chart(hd, color=["#2F7D6D", "#B8372C"], sort=False)
+        render_heatmap()
+        with st.expander("최근 14일 맞음·틀림 막대그래프"):
+            days = [(today_date() - timedelta(days=d)).isoformat() for d in range(13, -1, -1)]
+            hd = pd.DataFrame(
+                {"맞음": [s.history.get(d, {}).get("right", 0) for d in days],
+                 "틀림": [s.history.get(d, {}).get("wrong", 0) for d in days]},
+                index=[d[5:] for d in days],
+            )
+            st.bar_chart(hd, color=["#2F7D6D", "#B8372C"], sort=False)
 
     weak = df[df["틀림"] > 0].sort_values(["정답률(%)", "틀림"], ascending=[True, False]).head(10)
     if len(weak):
@@ -2722,6 +2852,295 @@ def render_stats():
                    "브라우저도 있어서, 가끔 백업 파일을 받아 두면 안전해요. 복구는 왼쪽 메뉴 '진행 상황 저장 / 불러오기'에서 해요.")
         st.download_button("💾 백업 파일 받기", progress_json(), "hanja_progress.json", "application/json",
                            width="stretch", key="backup_stats")
+
+
+# ----------------------------------------------------------------------
+# 한자 분해 (구성 글자) — 단어장에서 한자를 누르면 어떤 글자들로 이루어졌는지 보여줘요
+#   休 = 亻(人 사람 인) + 木(나무 목)
+# 분해 데이터: 오픈 데이터 IDS(cjkvi-ids). 프로그램 폴더에 ids.txt(또는 data/ids.txt)를 두면 그걸 쓰고,
+# 없으면 처음 한 번 내려받아요. 부수 이름(훈음)은 아래 표 + 내 단어장에 있는 한자의 뜻·음을 써요.
+# ----------------------------------------------------------------------
+IDS_URLS = [
+    "https://raw.githubusercontent.com/cjkvi/cjkvi-ids/master/ids.txt",
+    "https://cdn.jsdelivr.net/gh/cjkvi/cjkvi-ids@master/ids.txt",  # 예비 주소
+]
+IDS_RETRY_SEC = 120  # 내려받기에 실패하면 이 시간 동안은 다시 시도하지 않아요
+BU_CARD_LIMIT = 800  # 카드가 너무 많으면 화면이 무거워져서, 앞쪽 이만큼만 눌러서 볼 수 있게 해요
+
+# 강희 214 부수 (훈음은 한국 한자 자전 기준)
+RADICAL_TEXT = """
+一 한 일|丨 뚫을 곤|丶 점 주|丿 삐침 별|乙 새 을|亅 갈고리 궐|二 두 이|亠 돼지해머리 두|人 사람 인|儿 어진사람 인
+入 들 입|八 여덟 팔|冂 멀 경|冖 덮을 멱|冫 이수변 빙|几 안석 궤|凵 입벌릴 감|刀 칼 도|力 힘 력|勹 쌀 포
+匕 비수 비|匚 상자 방|匸 감출 혜|十 열 십|卜 점 복|卩 병부 절|厂 기슭 엄|厶 사사 사|又 또 우|口 입 구
+囗 에울 위|土 흙 토|士 선비 사|夂 뒤져올 치|夊 천천히 걸을 쇠|夕 저녁 석|大 큰 대|女 여자 녀|子 아들 자|宀 갓머리 면
+寸 마디 촌|小 작을 소|尢 절름발이 왕|尸 주검 시|屮 싹날 철|山 메 산|巛 개미허리 천|工 장인 공|己 몸 기|巾 수건 건
+干 방패 간|幺 작을 요|广 집 엄|廴 민책받침 인|廾 스물입발 공|弋 주살 익|弓 활 궁|彐 튼가로왈 계|彡 터럭 삼|彳 두인변 척
+心 마음 심|戈 창 과|戶 지게 호|手 손 수|支 지탱할 지|攴 칠 복|文 글월 문|斗 말 두|斤 도끼 근|方 모 방
+无 없을 무|日 날 일|曰 가로 왈|月 달 월|木 나무 목|欠 하품 흠|止 그칠 지|歹 뼈앙상할 알|殳 몽둥이 수|毋 말 무
+比 견줄 비|毛 터럭 모|氏 성씨 씨|气 기운 기|水 물 수|火 불 화|爪 손톱 조|父 아비 부|爻 사귈 효|爿 조각 장
+片 조각 편|牙 어금니 아|牛 소 우|犬 개 견|玄 검을 현|玉 구슬 옥|瓜 오이 과|瓦 기와 와|甘 달 감|生 날 생
+用 쓸 용|田 밭 전|疋 필 필|疒 병질 엄|癶 필발머리 발|白 흰 백|皮 가죽 피|皿 그릇 명|目 눈 목|矛 창 모
+矢 화살 시|石 돌 석|示 보일 시|禸 짐승발자국 유|禾 벼 화|穴 구멍 혈|立 설 립|竹 대 죽|米 쌀 미|糸 실 사
+缶 장군 부|网 그물 망|羊 양 양|羽 깃 우|老 늙을 로|而 말이을 이|耒 쟁기 뢰|耳 귀 이|聿 붓 율|肉 고기 육
+臣 신하 신|自 스스로 자|至 이를 지|臼 절구 구|舌 혀 설|舛 어그러질 천|舟 배 주|艮 그칠 간|色 빛 색|艸 풀 초
+虍 범호엄 호|虫 벌레 충|血 피 혈|行 다닐 행|衣 옷 의|襾 덮을 아|見 볼 견|角 뿔 각|言 말씀 언|谷 골 곡
+豆 콩 두|豕 돼지 시|豸 해태 치|貝 조개 패|赤 붉을 적|走 달릴 주|足 발 족|身 몸 신|車 수레 거|辛 매울 신
+辰 별 진|辵 책받침 착|邑 고을 읍|酉 닭 유|釆 분별할 변|里 마을 리|金 쇠 금|長 길 장|門 문 문|阜 언덕 부
+隶 미칠 이|隹 새 추|雨 비 우|靑 푸를 청|非 아닐 비|面 낯 면|革 가죽 혁|韋 다룬가죽 위|韭 부추 구|音 소리 음
+頁 머리 혈|風 바람 풍|飛 날 비|食 밥 식|首 머리 수|香 향기 향|馬 말 마|骨 뼈 골|高 높을 고|髟 터럭발 표
+鬥 싸울 투|鬯 울창주 창|鬲 솥 력|鬼 귀신 귀|魚 물고기 어|鳥 새 조|鹵 짠땅 로|鹿 사슴 록|麥 보리 맥|麻 삼 마
+黃 누를 황|黍 기장 서|黑 검을 흑|黹 바느질할 치|黽 맹꽁이 맹|鼎 솥 정|鼓 북 고|鼠 쥐 서|鼻 코 비|齊 가지런할 제
+齒 이 치|龍 용 룡|龜 거북 귀|龠 피리 약
+"""
+# 부수는 아니지만 자주 나오는 구성 글자
+EXTRA_TEXT = """
+王 임금 왕|中 가운데 중|千 일천 천|也 어조사 야|良 어질 량|可 옳을 가|才 재주 재|永 길 영|京 서울 경|少 적을 소
+"""
+# 모양이 바뀐 부수 → 원래 부수 (예: 亻은 人이 왼쪽에 올 때의 모양)
+VARIANT = {
+    "亻": "人", "氵": "水", "氺": "水", "扌": "手", "忄": "心", "㣺": "心", "⺖": "心", "犭": "犬", "艹": "艸",
+    "⺾": "艸", "礻": "示", "衤": "衣", "罒": "网", "⺫": "目", "刂": "刀", "灬": "火", "爫": "爪", "牜": "牛",
+    "糹": "糸", "飠": "食", "⺼": "肉", "攵": "攴", "辶": "辵", "⻌": "辵", "耂": "老", "⺮": "竹", "彑": "彐",
+    "覀": "襾", "歺": "歹", "青": "靑", "戸": "戶", "户": "戶", "黄": "黃", "𧾷": "足", "⻏": "邑", "⻖": "阜",
+}
+# 왼쪽/오른쪽에 따라 둘로 갈리는 모양
+SPECIAL = {"阝": ("언덕 부 · 고을 읍", "왼쪽에 있으면 阜(언덕), 오른쪽에 있으면 邑(고을)")}
+
+
+def _kv_table(text):
+    out = {}
+    for item in text.replace("\n", "|").split("|"):
+        item = item.strip()
+        if item:
+            ch, _, mean = item.partition(" ")
+            out[ch] = mean.strip()
+    return out
+
+
+RADICALS = _kv_table(RADICAL_TEXT)
+EXTRA_COMP = _kv_table(EXTRA_TEXT)
+
+IDC_NAMES = {
+    "⿰": "왼쪽·오른쪽으로 나란히", "⿱": "위·아래로 쌓음", "⿲": "왼쪽·가운데·오른쪽 세 부분",
+    "⿳": "위·가운데·아래 세 부분", "⿴": "바깥 글자가 안쪽을 에워쌈", "⿵": "위에서 감싸 내려옴",
+    "⿶": "아래에서 감싸 올라감", "⿷": "왼쪽에서 감싸 안음", "⿸": "왼쪽 위에서 감쌈",
+    "⿹": "오른쪽 위에서 감쌈", "⿺": "왼쪽 아래에서 감쌈", "⿻": "서로 겹쳐진 모양",
+    "⿼": "서로 겹쳐진 모양", "⿽": "서로 겹쳐진 모양",
+}
+IDC_ARITY = {c: 2 for c in "⿰⿱⿴⿵⿶⿷⿸⿹⿺⿻⿼⿽㇯"}
+IDC_ARITY.update({"⿲": 3, "⿳": 3, "⿾": 1, "⿿": 1})
+_IDS_TOKEN = re.compile(r"&[^;\s]+;|.", re.S)
+
+
+@st.cache_resource(show_spinner=False)
+def _ids_state():
+    """분해 표를 화면이 다시 그려져도 기억해요 (실행마다 새로 내려받지 않게)"""
+    return {"table": None, "source": "", "fail_at": 0.0}
+
+
+_IDS = _ids_state()
+
+
+def parse_ids_text(text):
+    """ids.txt 한 줄: 'U+4F11<탭>休<탭>⿰亻木'  (한국 자형 표시 [K]가 있으면 그걸 우선)"""
+    table = {}
+    for ln in text.splitlines():
+        if not ln or ln.startswith(";"):
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 3 or not parts[0].startswith("U+"):
+            continue
+        ch = parts[1]
+        if len(ch) != 1 or ord(ch) >= 0x30000:  # &CDP-…; 같은 특수 항목은 건너뜀
+            continue
+        best = None
+        for cand in parts[2:]:
+            m = re.match(r"^(.*?)(?:\[([A-Z]+)\])?$", cand.strip())
+            ids, tag = m.group(1), m.group(2) or ""
+            if not ids:
+                continue
+            if best is None:
+                best = ids
+            if "K" in tag:
+                best = ids
+                break
+        if best and best != ch:  # 자기 자신뿐이면 더 나눌 수 없는 글자
+            table[ch] = best
+    return table
+
+
+def _ids_paths():
+    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
+    return [os.path.join(here, "ids.txt"), os.path.join(here, "data", "ids.txt"), "ids.txt", "data/ids.txt",
+            os.path.join(tempfile.gettempdir(), "hanja_ids", "ids.txt")]
+
+
+def load_ids():
+    """분해 표를 돌려줘요. 없으면 내려받고, 실패하면 None (한동안 다시 시도하지 않아요)"""
+    if _IDS["table"]:
+        return _IDS["table"]
+    for p in _ids_paths():
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    t = parse_ids_text(f.read())
+                if len(t) > 1000:
+                    _IDS.update(table=t, source=p)
+                    return t
+            except Exception:
+                continue
+    if time.time() - _IDS["fail_at"] < IDS_RETRY_SEC:
+        return None
+    cache = os.path.join(tempfile.gettempdir(), "hanja_ids", "ids.txt")
+    for url in IDS_URLS:
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = r.read()
+            t = parse_ids_text(data.decode("utf-8"))
+            if len(t) > 1000:
+                try:
+                    os.makedirs(os.path.dirname(cache), exist_ok=True)
+                    with open(cache + ".part", "wb") as f:
+                        f.write(data)
+                    os.replace(cache + ".part", cache)
+                except Exception:
+                    pass
+                _IDS.update(table=t, source=url)
+                return t
+        except Exception:
+            continue
+    _IDS["fail_at"] = time.time()
+    return None
+
+
+def load_ids_with_notice():
+    if _IDS["table"]:
+        return _IDS["table"]
+    with st.spinner("한자 구성 데이터를 불러오는 중이에요… (처음 한 번만, 몇 초 걸려요)"):
+        t = load_ids()
+    if not t:
+        st.warning("한자 구성 데이터를 불러오지 못했어요. 인터넷 연결을 확인하고 잠시 뒤 다시 켜 주세요. "
+                   "(또는 cjkvi-ids의 ids.txt 파일을 hanja.py와 같은 폴더에 넣어 두면 바로 써요)")
+    return t
+
+
+def parse_ids_tree(ids):
+    """앞에서부터 읽는 IDS('⿰亻木')를 트리로: 글자 또는 (구조기호, [자식…])"""
+    toks = _IDS_TOKEN.findall(ids)
+    pos = 0
+
+    def node():
+        nonlocal pos
+        if pos >= len(toks):
+            return "?"
+        t = toks[pos]
+        pos += 1
+        n = IDC_ARITY.get(t)
+        if n:
+            kids = []
+            for _ in range(n):
+                kids.append(node())
+            return (t, kids)
+        return t
+
+    return node()
+
+
+def _leaves(node):
+    if isinstance(node, tuple):
+        out = []
+        for k in node[1]:
+            out += _leaves(k)
+        return out
+    return [node]
+
+
+def comp_info(c, by):
+    """구성 글자 하나의 설명: 훈음, 부수 여부, 변형 설명"""
+    if c in SPECIAL:
+        return {"mean": SPECIAL[c][0], "radical": True, "note": SPECIAL[c][1]}
+    base = VARIANT.get(c, c)
+    w = by.get(c) or by.get(base)
+    mean = f"{w['meaning']} {w['sound']}".strip() if w and (w.get("meaning") or w.get("sound")) else ""
+    if not mean:
+        mean = RADICALS.get(base) or EXTRA_COMP.get(base) or ""
+    note = f"{base}({RADICALS.get(base, '').strip() or '…'})이 모양을 바꾼 글자" if base != c else ""
+    return {"mean": mean, "radical": base in RADICALS, "note": note}
+
+
+def decomp_tree(ch, table, depth=2):
+    """한자 하나를 구성 글자로 쪼개요. 더 못 쪼개면 None.
+    {'idc':구조기호, 'parts':[{'ch':글자, 'n':반복 횟수, 'sub':하위 분해 또는 None}]}"""
+    ids = table.get(ch)
+    if not ids:
+        return None
+    tree = parse_ids_tree(ids)
+    if not isinstance(tree, tuple):
+        return None
+    parts = []
+    for leaf in _leaves(tree):
+        if parts and parts[-1]["ch"] == leaf:
+            parts[-1]["n"] += 1
+            continue
+        parts.append({"ch": leaf, "n": 1, "sub": None})
+    if depth > 1:
+        for p in parts:
+            c = p["ch"]
+            if (len(c) == 1 and c not in VARIANT and c not in SPECIAL and c not in EXTRA_COMP
+                    and VARIANT.get(c, c) not in RADICALS):
+                p["sub"] = decomp_tree(c, table, depth - 1)
+    return {"idc": tree[0], "parts": parts}
+
+
+def _part_html(p, by):
+    c = p["ch"]
+    if len(c) > 1:  # &CDP-8BF4; 처럼 화면에 그릴 수 없는 조각
+        return "<span class='bu-part'><b>▯</b><i>글자 없음</i></span>"
+    info = comp_info(c, by)
+    cls = "bu-part rad" if info["radical"] else "bu-part"
+    cnt = f"<em>×{p['n']}</em>" if p["n"] > 1 else ""
+    title = f" title='{esc(info['note'])}'" if info["note"] else ""
+    return f"<span class='{cls}'{title}><b>{esc(c)}</b><i>{esc(info['mean'] or '뜻 정보 없음')}</i>{cnt}</span>"
+
+
+def _eq_html(ch, tr, by):
+    parts = "<span class='bu-op'>+</span>".join(_part_html(p, by) for p in tr["parts"])
+    return f"<div class='bu-eq'><span class='bu-big'>{esc(ch)}</span><span class='bu-op'>=</span>{parts}</div>"
+
+
+def _sub_html(tr, by):
+    out = ""
+    for p in tr["parts"]:
+        # 아는 글자가 하나도 없이 획 조각만 나오는 경우는 보여 줘도 도움이 안 돼서 숨겨요
+        if p["sub"] and any(len(q["ch"]) == 1 and (comp_info(q["ch"], by)["mean"]) for q in p["sub"]["parts"]):
+            out += (f"<div class='bu-sub'>{_eq_html(p['ch'], p['sub'], by)}"
+                    f"<div class='bu-note'>{esc(IDC_NAMES.get(p['sub']['idc'], ''))}</div></div>")
+    return out
+
+
+def decomp_html(word, by, table):
+    """단어(한 글자 이상)의 글자마다 구성 글자를 보여주는 HTML 조각"""
+    blocks = []
+    for ch in list(dict.fromkeys(c for c in str(word) if has_hanja(c)))[:6]:
+        tr = decomp_tree(ch, table)
+        if tr:
+            blocks.append(f"<div class='bu-char'>{_eq_html(ch, tr, by)}"
+                          f"<div class='bu-note'>{esc(IDC_NAMES.get(tr['idc'], ''))}</div>{_sub_html(tr, by)}</div>")
+            continue
+        info = comp_info(ch, by)
+        if ch in table:
+            msg = "분해 정보를 찾지 못했어요."
+        elif info["radical"]:
+            msg = f"더 나눌 수 없는 기본 글자예요 · <b>{esc(info['mean'])}</b> (부수)"
+        else:
+            msg = "더 나눌 수 없는 기본 글자예요."
+            if info["mean"]:
+                msg += f" · <b>{esc(info['mean'])}</b>"
+        blocks.append(f"<div class='bu-char'><div class='bu-eq'><span class='bu-big'>{esc(ch)}</span>"
+                      f"<span class='bu-note'>{msg}</span></div></div>")
+    if not blocks:
+        return "<div class='bu-note'>한자가 아니라 분해할 수 없어요.</div>"
+    return "".join(blocks)
 
 
 def _terms(q):
@@ -2759,6 +3178,11 @@ def render_study():
     c1, c2 = st.columns(2)
     hide = c1.toggle("암기 모드 (뜻·음 가리기, 눌러서 확인)", value=False)
     view = c2.radio("보기", ["카드", "표"], horizontal=True, label_visibility="collapsed")
+    bu_on = st.toggle("🧩 한자 눌러서 구성 글자(부수) 보기", value=False, key="st_bu",
+                      help="카드에서는 한자를 누르면 펼쳐지고, 표에서는 줄을 고르면 아래에 나와요.")
+    ids_table = load_ids_with_notice() if bu_on else None
+    bu = bool(ids_table)
+    by_h = {w["hanja"]: w for w in s.words} if bu else {}
     flt = st.radio("모아 보기", ["전체", "★ 별표", "📝 메모"], horizontal=True, key="st_filter",
                    label_visibility="collapsed")
     total = len(s.words)
@@ -2784,17 +3208,33 @@ def render_study():
             df["메모"] = [note_of(h) for h in df["한자"]]
         if hide and len(df):
             df["뜻"], df["음"] = "???", "?"
-        st.dataframe(df, width="stretch", hide_index=True, height=480)
+        if bu and len(df):
+            ev = st.dataframe(df, width="stretch", hide_index=True, height=480, on_select="rerun",
+                              selection_mode="single-row", key="st_tbl_sel")
+            rows = list(ev.selection.rows) if ev is not None and ev.selection is not None else []
+            if rows and rows[0] < len(words):
+                html(f"<div class='bu-body open'>{decomp_html(words[rows[0]]['hanja'], by_h, ids_table)}</div>")
+            else:
+                st.caption("🧩 표에서 줄 맨 왼쪽 칸을 누르면 아래에 그 한자의 구성 글자가 나와요.")
+        else:
+            st.dataframe(df, width="stretch", hide_index=True, height=480)
     else:
         cards = []
-        for w in words:
+        if bu and len(words) > BU_CARD_LIMIT:
+            st.caption(f"한자가 많아서 앞쪽 {BU_CARD_LIMIT}개만 눌러서 볼 수 있어요. 검색으로 좁히면 모두 볼 수 있어요.")
+        for i, w in enumerate(words):
             mean = f"<b>{highlight(w['meaning'], terms)}</b> {highlight(w['sound'], terms)}"
             body = f"<details><summary>보기</summary>{mean}</details>" if hide else mean
             g = f"<div class='g'>{esc(w['group'])}</div>" if w.get("group") else ""
             star = "<span class='star'>★</span>" if is_star(w["hanja"]) else ""
             nt = note_of(w["hanja"])
             note_html = f"<div class='note' title='{esc(nt)}'>📝 {esc(nt)}</div>" if nt else ""
-            cards.append(f"<div class='wcard'>{star}<div class='h'>{highlight(w['hanja'], terms)}</div><div class='m'>{body}</div>{g}{note_html}</div>")
+            if bu and i < BU_CARD_LIMIT:  # 한자를 누르면 펼쳐지는 구성 글자 (화면을 새로 그리지 않아요)
+                head = f"<details class='bu'><summary>{highlight(w['hanja'], terms)}</summary></details>"
+                tail = f"<div class='bu-body'>{decomp_html(w['hanja'], by_h, ids_table)}</div>"
+            else:
+                head, tail = f"<div class='h'>{highlight(w['hanja'], terms)}</div>", ""
+            cards.append(f"<div class='wcard'>{star}{head}<div class='m'>{body}</div>{g}{note_html}{tail}</div>")
         html("<div class='wgrid'>" + "".join(cards) + "</div>")
     st.divider()
     render_set_tools()
