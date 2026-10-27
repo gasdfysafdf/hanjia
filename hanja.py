@@ -727,7 +727,7 @@ TYPE_LABELS = {
 }
 SETTING_DEFAULTS = dict(
     set_type="섞어서", set_source="전체 단어", set_count=10, set_shuffle=True, set_groups=[],
-    set_goal=20, set_stroke=8, set_canvas_px=220,
+    set_goal=20, set_stroke=8, set_canvas_px=180,
     card_src="전체 단어", card_dir="한자 → 뜻·음", card_shuffle=True, card_count=20,
     # 시험 플랜
     set_exam_date="", set_target=90, plan_groups=[],
@@ -760,7 +760,7 @@ def init_state():
         restored=False, store_ok=None,
         notes={}, idioms=[], idiom_sig=None, idiom_stats={}, idiom_wrong={},
         iquiz=[], ipos=0, ires=[], inonce=0, iretry=False,
-        ed_ver=0, notice=None, hw_clear=0,
+        ed_ver=0, notice=None, hw_clear=0, up_gen=0, wipe_id=0,
     )
     defaults.update(GRADE_DEFAULTS)
     defaults.update(SETTING_DEFAULTS)
@@ -1013,6 +1013,18 @@ def reset_quiz():
     s.feedback, s.hint = None, False
     s.nonce += 1
     s.flash = "퀴즈를 마쳤어요. 설정을 바꿔서 다시 시작할 수 있어요."
+
+
+def factory_reset():
+    """앱을 처음 상태로: 단어장·기록·메모·설정·진행 중인 퀴즈, 그리고 이 브라우저의 자동 저장까지 전부 지워요"""
+    s = st.session_state
+    gen, wipe, store_ok = s.get("up_gen", 0) + 1, s.get("wipe_id", 0) + 1, s.get("store_ok")
+    for k in list(s.keys()):
+        del s[k]
+    s.up_gen = gen  # 파일 올리는 칸도 새것으로 (올려 둔 파일이 다시 읽히지 않게)
+    s.wipe_id = wipe  # 브라우저 저장소를 비우라는 신호
+    s.restored, s.store_ok = True, store_ok  # 지운 옛 기록을 다시 불러오지 않게
+    s.flash = "앱을 처음 상태로 되돌렸어요."
 
 
 def reset_all():
@@ -1567,6 +1579,73 @@ def commit_words(new_words):
                "진행 중이던 퀴즈·카드는 안전하게 비웠어요. 새로 시작해 주세요.")
 
 
+def delete_words(keys, with_records=False):
+    """고른 한자를 단어장에서 지워요. with_records=True 면 그 한자의 오답·통계·복습·메모 기록도 같이 지워요.
+    단어장이 비게 되면 시작 화면으로 돌아가요."""
+    s = st.session_state
+    keys = set(keys)
+    before = len(s.words)
+    s.words = [w for w in s.words if w["hanja"] not in keys]
+    n = before - len(s.words)
+    if with_records:
+        for book in (s.wrong, s.stats, s.srs, s.notes):
+            for k in keys:
+                book.pop(k, None)
+    reset_views()
+    s.ed_ver += 1
+    if not s.words:  # 비었으면 파일 올리는 칸도 새것으로 (같은 파일을 다시 올릴 수 있게)
+        s.up_gen += 1
+        s.file_sig = None
+    s.flash = f"한자 {n}개를 삭제했어요." + (" 단어장이 비었어요." if not s.words else "")
+
+
+def delete_selected_cb():
+    s = st.session_state
+    keys = list(s.get("del_pick", []))
+    if keys:
+        delete_words(keys, bool(s.get("del_rec", False)))
+    s.del_pick = []
+    s.del_rec = False
+
+
+def delete_all_cb():
+    s = st.session_state
+    delete_words([w["hanja"] for w in s.words], bool(s.get("del_rec", False)))
+    s.del_pick, s.del_rec, s.del_all_ok = [], False, False
+
+
+def add_words_from_text(text):
+    """붙여넣은 글의 한자를 지금 단어장 뒤에 이어 붙여요. 이미 있는 한자는 새 뜻·음만 '/'로 덧붙여요.
+    반환: 사용자에게 보여줄 안내 문구, 성공 여부"""
+    s = st.session_state
+    rows, bad = [], 0
+    for r in parse_text(strip_comments(text or "")):
+        g = (r[3] if len(r) > 3 else "").strip()
+        if word_problem(r[0].strip(), r[1].strip(), r[2].strip(), g):
+            bad += 1
+        else:
+            rows.append(r)
+    if not rows:
+        return "읽을 수 있는 줄이 없어요. 한 줄에 '한자 뜻 음' 모양인지 확인해 주세요.", False
+    old = [(w["hanja"], w["meaning"], w["sound"], w.get("group", "")) for w in s.words]
+    words, _, _ = build_words(old + rows)
+    if words == s.words:
+        return "새로 추가할 내용이 없어요. (이미 단어장에 있는 한자예요)", False
+    commit_words(words)  # 추가·수정 개수 안내와 퀴즈 정리는 여기서 해요
+    if bad:
+        s.flash += f" (형식이 맞지 않아 건너뛴 줄 {bad}개)"
+    return s.flash, True
+
+
+def paste_add_cb(text_key):
+    s = st.session_state
+    msg, ok = add_words_from_text(s.get(text_key, ""))
+    if ok:
+        s[text_key] = ""  # 성공하면 입력칸을 비워요
+    else:
+        s.flash = msg
+
+
 # ----------------------------------------------------------------------
 # 자동 저장 (이 기기의 브라우저에 보관) + 불러온 기록 검증
 # ----------------------------------------------------------------------
@@ -1579,7 +1658,7 @@ STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body st
     for (var k in data) { m[k] = data[k]; }
     window.parent.postMessage(m, "*");
   }
-  var loaded = false, last = null;
+  var loaded = false, last = null, lastClear = 0;
   function canStore() {
     try {
       window.localStorage.setItem("__hanja_test", "1");
@@ -1594,6 +1673,11 @@ STORE_HTML = """<!doctype html><html><head><meta charset="utf-8"></head><body st
     var d = ev.data;
     if (!d || d.type !== "streamlit:render") { return; }
     var a = d.args || {};
+    if (typeof a.clear === "number" && a.clear > lastClear) {  // 앱 완전 초기화: 저장돼 있던 기록 삭제
+      lastClear = a.clear;
+      try { window.localStorage.removeItem(KEY); } catch (e) {}
+      last = null;
+    }
     if (!loaded) {
       loaded = true;
       send("streamlit:setComponentValue", {
@@ -1768,7 +1852,7 @@ def apply_payload(raw):
             if k in ALLOWED and v not in ALLOWED[k]:
                 continue
             if k == "set_canvas_px":  # 엉뚱한 값이 저장돼 있어도 슬라이더가 깨지지 않게 범위 안으로
-                v = _int(v, 220, 140, 360)
+                v = _int(v, 180, 120, 360)
             if k == "set_exam_date":
                 v = _iso(v) or ""
             if k == "plan_groups":
@@ -1802,7 +1886,7 @@ def sync_browser_store():
         save = build_payload()  # 불러오기 전에는 저장하지 않아서, 빈 상태가 기존 기록을 덮어쓰지 않아요
     try:
         with st.container(key="store_box"):
-            got = _store_component()(save=save, key="browser_store", default=None)
+            got = _store_component()(save=save, clear=int(s.get("wipe_id", 0)), key="browser_store", default=None)
     except Exception:
         s.restored, s.store_ok = True, False
         return
@@ -2111,7 +2195,7 @@ SAMPLE_CSV = (
 def load_panel():
     """단어장 불러오기 (파일 업로드 / 직접 붙여넣기). 단어장이 없을 땐 시작 화면에, 있을 땐 사이드바에 나와요"""
     s = st.session_state
-    f = st.file_uploader("한자 파일 (txt / csv / xlsx)", key="wordfile")  # 형식 제한 없음: 태블릿 호환
+    f = st.file_uploader("한자 파일 (txt / csv / xlsx)", key=f"wordfile_{s.up_gen}")  # 형식 제한 없음: 태블릿 호환
     st.download_button("샘플 CSV 받기", SAMPLE_CSV.encode("utf-8-sig"), "sample_hanja.csv", "text/csv")
     st.caption("한 줄에 '한자, 뜻, 음'. 4번째 열에 '급수/단원/분류'를 넣으면 범위를 골라 풀 수 있어요.")
     if f is not None:
@@ -2130,8 +2214,13 @@ def load_panel():
                 s.flash = f"파일을 읽지 못했어요: {e}"
     with st.expander("✍️ 텍스트 직접 붙여넣기 (파일이 안 될 때)"):
         pasted = st.text_area("한 줄에 '한자 뜻 음' (예: 天 하늘 천)", height=150, key="paste_text")
-        if st.button("붙여넣은 내용 적용"):
-            words, dropped, merged = build_words(parse_text(pasted))
+        if s.words:
+            st.button("➕ 지금 단어장에 추가", type="primary", on_click=paste_add_cb, args=("paste_text",),
+                      key="paste_add_btn", width="stretch",
+                      help="지금 단어장은 그대로 두고, 붙여넣은 한자를 뒤에 더해요. 이미 있는 한자는 새 뜻·음만 덧붙여요.")
+            st.caption("아래 버튼은 지금 단어장을 지우고 붙여넣은 내용으로 바꿔요.")
+        if st.button("붙여넣은 내용으로 교체" if s.words else "붙여넣은 내용 적용", key="paste_apply_btn"):
+            words, dropped, merged = build_words(parse_text(strip_comments(pasted)))
             if words:
                 s.words, s.quiz, s.cards = words, [], None
                 s.file_sig = (f.name, f.size) if f is not None else None  # 업로드 파일이 덮어쓰지 않게
@@ -2145,7 +2234,7 @@ def load_sample():
     df = pd.read_csv(io.StringIO(SAMPLE_CSV), header=None, dtype=str, keep_default_na=False)
     words, _, _ = build_words(parse_table(df))
     s.words, s.quiz, s.cards = words, [], None
-    f = s.get("wordfile")
+    f = s.get(f"wordfile_{s.up_gen}")
     s.file_sig = (f.name, f.size) if f is not None else None  # 이미 올려 둔 파일이 샘플을 덮어쓰지 않게
     s.flash = f"샘플 한자 {len(words)}개를 불러왔어요. 마음껏 둘러보세요!"
 
@@ -2294,7 +2383,7 @@ def answer_choice(w, ty, o):
 # --- 한자 쓰기 ----------------------------------------------------------------
 def canvas_px():
     """한자를 쓰는 칸의 한 변 길이(px). 사이드바의 '쓰는 칸 크기'에서 바꿀 수 있어요"""
-    return _int(st.session_state.get("set_canvas_px"), 220, 140, 360)
+    return _int(st.session_state.get("set_canvas_px"), 180, 120, 360)
 
 
 def flatten(data):
@@ -2886,7 +2975,7 @@ def sidebar():
             load_panel()
     st.sidebar.number_input("오늘의 목표 (문제 수)", 5, 500, step=5, key="set_goal")
     st.sidebar.slider("펜 굵기", 3, 20, key="set_stroke")
-    st.sidebar.slider("쓰는 칸 크기", 140, 360, step=20, key="set_canvas_px",
+    st.sidebar.slider("쓰는 칸 크기", 120, 360, step=20, key="set_canvas_px",
                       help="한자를 쓰는 칸의 크기예요. 화면이 작으면 줄이세요. (바꾸면 쓰던 글씨는 지워져요)")
     grading_sidebar()
 
@@ -2894,7 +2983,7 @@ def sidebar():
         st.caption("평소엔 이 기기에 자동 저장돼요. 다른 기기로 옮기거나 백업할 때만 쓰세요. (오답 노트·통계·복습 기록·날짜별 기록·메모·사자성어 기록·플랜 설정)")
         st.download_button("💾 저장", progress_json(), "hanja_progress.json", "application/json", width="stretch",
                            key="backup_side")
-        pf = st.file_uploader("불러오기", type=["json"], key="progress_file")
+        pf = st.file_uploader("불러오기", type=["json"], key=f"progress_file_{s.up_gen}")
         if pf is not None and (pf.name, pf.size) != s.progress_sig:
             try:
                 data = json.loads(pf.getvalue().decode("utf-8"))
@@ -2920,8 +3009,15 @@ def sidebar():
         st.caption("화면이 이상하게 동작하면 주소 끝에 ?nostore=1 을 붙여 접속해 보세요. (자동 저장 없이 실행)")
         st.divider()
         st.button("🔄 퀴즈 초기화", on_click=reset_quiz, width="stretch")
-        st.checkbox("전체 초기화 확인 (오답 노트·통계·복습 기록 삭제)", key="confirm_reset")
-        st.button("🗑️ 전체 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
+        st.checkbox("기록 초기화 확인 (오답 노트·통계·복습 기록 삭제, 단어장·메모는 유지)", key="confirm_reset")
+        st.button("🗑️ 기록만 초기화", on_click=reset_all, disabled=not s.get("confirm_reset", False), width="stretch")
+        st.divider()
+        st.markdown("**⚠️ 앱 완전 초기화**")
+        st.caption("단어장·학습 기록·메모·설정, 그리고 이 브라우저에 자동 저장된 내용까지 전부 지우고 처음 상태로 돌아가요. "
+                   "되돌릴 수 없으니, 필요하면 먼저 위의 '💾 진행 상황 저장'으로 백업을 받아 두세요.")
+        st.checkbox("전부 지워도 괜찮아요", key="confirm_factory")
+        st.button("☢️ 앱 완전 초기화", on_click=factory_reset, type="primary",
+                  disabled=not s.get("confirm_factory", False), width="stretch")
 
 
 def run_app():
@@ -4259,10 +4355,47 @@ def render_word_edit():
         st.caption("받은 파일을 GitHub 저장소의 wordsets/ 폴더에 올리면 '내장 단어장'이 돼요. 파일 이름이 세트 이름이에요.")
 
 
+def render_word_paste():
+    s = st.session_state
+    with st.expander("➕ 붙여넣어서 한자 추가"):
+        st.caption("지금 단어장은 그대로 두고, 한자를 뒤에 더해요. 한 줄에 '한자 뜻 음' (예: 天 하늘 천). "
+                   "쉼표·탭으로 나누면 4번째 칸은 분류로 들어가요. 이미 있는 한자는 새 뜻·음만 '/'로 덧붙여요.")
+        st.text_area("추가할 한자", height=140, key="wp_text", placeholder="天 하늘 천\n地 땅 지")
+        st.button("➕ 단어장에 추가", type="primary", on_click=paste_add_cb, args=("wp_text",),
+                  key="wp_add_btn", width="stretch")
+        st.caption("추가하면 진행 중이던 퀴즈·카드는 비워져요.")
+
+
+def render_word_delete():
+    s = st.session_state
+    with st.expander("🗑️ 한자 삭제"):
+        by = {w["hanja"]: w for w in s.words}
+        opts = list(by)[:3000]
+        s.del_pick = [x for x in s.get("del_pick", []) if x in by]  # 단어장이 바뀌어도 위젯이 깨지지 않게
+
+        def fmt(h):
+            w = by.get(h, {})
+            return f"{h}  {w.get('meaning', '')} {w.get('sound', '')}".strip()
+
+        st.multiselect("지울 한자 고르기", opts, key="del_pick", format_func=fmt, placeholder="여러 개 고르기")
+        st.checkbox("그 한자의 오답·통계·복습·메모 기록도 함께 지우기", key="del_rec",
+                    help="체크하지 않으면 단어장에서만 빠지고, 이미 쌓인 기록은 남아요.")
+        st.button("선택한 한자 삭제", on_click=delete_selected_cb, key="del_sel_btn", width="stretch",
+                  disabled=not s.get("del_pick"))
+        st.divider()
+        st.markdown("**단어장 전체 삭제**")
+        st.caption(f"한자 {len(s.words)}개를 모두 지우고 처음 단어장 불러오는 화면으로 돌아가요. (위의 '기록도 함께 지우기' 선택이 그대로 적용돼요)")
+        st.checkbox("모든 한자를 지울게요", key="del_all_ok")
+        st.button("🗑️ 단어장 전체 삭제", on_click=delete_all_cb, key="del_all_btn", width="stretch",
+                  disabled=not s.get("del_all_ok", False))
+
+
 def render_set_tools():
     with st.expander("📂 내장 단어장 불러오기"):
         set_picker("word", "study", show=False)
+    render_word_paste()
     render_word_edit()
+    render_word_delete()
 
 
 
